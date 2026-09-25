@@ -35,6 +35,12 @@ jobs:
       - name: Build site
         working-directory: app
         run: npm run build
+        env:
+          # Repo-level Actions variables (Settings -> Secrets and variables ->
+          # Actions -> Variables). The publishable key is safe to ship — RLS
+          # guards the data. Leave unset and Pages serves demo mode.
+          VITE_SUPABASE_URL: ${{ vars.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_ANON_KEY: ${{ vars.VITE_SUPABASE_ANON_KEY }}
 
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v5

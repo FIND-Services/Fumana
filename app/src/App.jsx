@@ -7,6 +7,8 @@ import q3Video from "./assets/zuri/zuri-q3.mp4";
 import q4Video from "./assets/zuri/zuri-q4.mp4";
 import q5Video from "./assets/zuri/zuri-q5.mp4";
 import { LandingPage, RoleSelectionPage, AuthFormPage } from "./marketing";
+import * as store from "./lib/store";
+import { LLM_URL, TTS_URL, apiHeaders, signOut as authSignOut } from "./lib/backend";
 
 // ============================================================
 // Fumana platform. One application, one shared builder network.
@@ -84,8 +86,8 @@ button:focus-visible,a:focus-visible,input:focus-visible,textarea:focus-visible{
 // and never talks to a provider directly. Throws on a non-OK response so each
 // caller's catch keeps the feature inert until a provider is configured.
 async function callClaude({ system, messages, expectJson }) {
-  const res = await fetch("/api/claude", {
-    method: "POST", headers: { "Content-Type": "application/json" },
+  const res = await fetch(LLM_URL, {
+    method: "POST", headers: await apiHeaders(),
     body: JSON.stringify({ system, messages }),
   });
   if (!res.ok) throw new Error("llm " + res.status);
@@ -892,7 +894,7 @@ function FairnessPosture({ onBack }) {
   </div></Scroll>;
 }
 
-function Settings({ builders, onDelete, onFairness, onAudit, onReport, onEthics, logAudit, premium, onUpgrade, onManage }) {
+function Settings({ builders, onDelete, onFairness, onAudit, onReport, onEthics, logAudit, premium, onUpgrade, onManage, onSignOut }) {
   const me = builders.find(b => b.isYou);
   const toast = useToast();
   const [lang, setLang] = useState("English");
@@ -958,6 +960,8 @@ function Settings({ builders, onDelete, onFairness, onAudit, onReport, onEthics,
     <Card><Label>Security</Label>
       <div style={row}><div><div style={{ fontSize: 14 }}>Two-factor authentication</div><div style={{ color: T.slate, fontSize: 12.5, marginTop: 2 }}>Placeholder. Real 2FA enrolment is a backend step.</div></div>
         <Toggle on={twoFA} label="Two-factor authentication" onClick={() => { setTwoFA(v => !v); toast("Two-factor setup runs on the backend."); }} /></div>
+      {onSignOut && <div style={row}><div><div style={{ fontSize: 14 }}>Sign out</div><div style={{ color: T.slate, fontSize: 12.5, marginTop: 2 }}>End this session on this device.</div></div>
+        <Btn small kind="ghost" onClick={onSignOut}>Sign out</Btn></div>}
     </Card>
     <div style={{ height: 14 }} />
 
@@ -1017,7 +1021,7 @@ const CAND_NAV = [
 // A first-class screen: reshapes the builder's raw, plainly-written experience
 // into recruiter-ready outcomes grounded only in what they wrote, with save and
 // copy. Routes through /api/claude; inert (clear waiting state) until a provider.
-function ExperienceAlchemist({ profile, onBuildCV }) {
+function ExperienceAlchemist({ profile, onBuildCV, onSave }) {
   const toast = useToast();
   const [raw, setRaw] = useState(profile.experience || "");
   const [busy, setBusy] = useState(false);
@@ -1069,10 +1073,10 @@ function ExperienceAlchemist({ profile, onBuildCV }) {
       </div>}
       {result.integrityNote && <p style={{ marginTop: 14, fontSize: 12.5, color: T.slate }}>{result.integrityNote}</p>}
       <div style={{ marginTop: 16, display: "flex", gap: 10, flexWrap: "wrap" }}>
-        <Btn small disabled={saved} onClick={() => { setSaved(true); toast("Saved. Real persistence is a backend step."); }}>{saved ? "Saved" : "Save to profile"}</Btn>
+        <Btn small disabled={saved} onClick={() => { setSaved(true); if (onSave) onSave(result, raw); toast("Saved to your profile."); }}>{saved ? "Saved" : "Save to profile"}</Btn>
         <Btn kind="ghost" small onClick={copy}>Copy</Btn>
       </div>
-      <div style={{ marginTop: 10, fontFamily: F.mono, fontSize: 11, color: T.slate }}>Saved locally in this prototype. Real persistence is a backend step.</div>
+      <div style={{ marginTop: 10, fontFamily: F.mono, fontSize: 11, color: T.slate }}>Saved to your builder profile when a backend is connected.</div>
       <div style={{ marginTop: 10, fontFamily: F.mono, fontSize: 10.5, color: T.slate }}>Reshaped by Telos from what you wrote. Nothing was added.</div>
     </Card></div>}
     <div style={{ height: 30 }} />
@@ -1448,19 +1452,29 @@ function UpgradeModal({ open, onClose, onComplete }) {
   </Modal>;
 }
 
-function CandidateApp({ addBuilder, removeBuilder, builders, pipeline, squads, joinSquad, leaveSquad, formSquad, audit, logAudit, exit, toRole }) {
-  const [screen, setScreen] = useState(DEMO_SEED ? "dashboard" : "signin");
-  const [profile, setProfile] = useState({ name: "", role: "", city: "", experience: "" });
-  const [accommodations, setAccommodations] = useState({ extraTime: false, textOnly: false, written: false });
-  const [result, setResult] = useState(DEMO_SEED ? SEED_RESULT : null);
+function CandidateApp({ addBuilder, removeBuilder, builders, pipeline, squads, joinSquad, leaveSquad, formSquad, audit, logAudit, exit, toRole, me, onSignOut }) {
+  // Session restore: when the backend returns my builder record, land on the
+  // dashboard with the assessment reconstructed from it. `me` is the raw
+  // builders row (snake_case).
+  const restored = Boolean(me && me.profile_strength != null);
+  const [screen, setScreen] = useState(DEMO_SEED ? "dashboard" : restored ? "dashboard" : "signin");
+  const [profile, setProfile] = useState({ name: me?.name || "", role: me?.role || "", city: me?.city || "", experience: me?.docs?.experience || "", cv: me?.docs?.cv || null });
+  const [accommodations, setAccommodations] = useState({ extraTime: false, textOnly: false, written: false, ...(me?.docs?.accommodations || {}) });
+  const [result, setResult] = useState(DEMO_SEED ? SEED_RESULT : restored ? {
+    dimensions: me.dimensions || [],
+    profileStrength: me.profile_strength,
+    tier: me.tier,
+    weakest: [...(me.dimensions || [])].sort((a, b) => a.score - b.score)[0],
+    transcript: me?.docs?.transcript || [],
+  } : null);
   const [points, setPoints] = useState(DEMO_SEED ? 120 : 0);
   const [culture, setCulture] = useState(null); // best Culture Shock Simulator score
-  const [premium, setPremium] = useState({ isPremium: false, premiumSince: null });
+  const [premium, setPremium] = useState({ isPremium: me?.is_premium || false, premiumSince: me?.premium_since || null });
   const [upgradeOpen, setUpgradeOpen] = useState(false);
   const openUpgrade = () => setUpgradeOpen(true);
-  function completeUpgrade() { setPremium({ isPremium: true, premiumSince: new Date().toISOString().slice(0, 10) }); toast("Welcome to FIND Premium Pro"); }
+  function completeUpgrade() { setPremium({ isPremium: true, premiumSince: new Date().toISOString().slice(0, 10) }); store.setPremium(true).catch(() => {}); toast("Welcome to FIND Premium Pro"); }
   const manageSub = () => toast("Subscription management is a backend step.");
-  const [published, setPublished] = useState(false);
+  const [published, setPublished] = useState(restored);
   const toast = useToast();
   const inApp = CAND_NAV.some(([k]) => k === screen) || ["fairness", "audit", "report", "ethics", "cvbuilder"].includes(screen);
 
@@ -1469,7 +1483,7 @@ function CandidateApp({ addBuilder, removeBuilder, builders, pipeline, squads, j
     const handle = "FB-" + Math.floor(1000 + Math.random() * 8999);
     const top = [...r.dimensions].sort((a, b) => b.score - a.score).slice(0, 3).map(d => d.name);
     const summary = `${profile.role || "Engineer"} with a ${r.tier.name} profile. Strongest in ${top.slice(0, 2).join(" and ")}. ${profile.experience.split(".")[0]}.`;
-    addBuilder({ handle, role: profile.role || "Engineer", summary, skills: top, profileStrength: r.profileStrength, tier: r.tier, dimensions: r.dimensions, isYou: true });
+    addBuilder({ handle, name: profile.name, city: profile.city, role: profile.role || "Engineer", summary, skills: top, profileStrength: r.profileStrength, tier: r.tier, dimensions: r.dimensions, experience: profile.experience, transcript: r.transcript, cv: profile.cv, accommodations, isYou: true });
     setPublished(true); setScreen("dashboard");
     logAudit({ kind: "assessment-completed" });
     logAudit({ kind: "score-issued", profileStrength: r.profileStrength, tier: r.tier.name });
@@ -1490,9 +1504,9 @@ function CandidateApp({ addBuilder, removeBuilder, builders, pipeline, squads, j
     {screen === "coach" && <NegotiationCoach profile={profile} builders={builders} pipeline={pipeline} premium={premium} onUpgrade={openUpgrade} />}
     {screen === "worth" && <GlobalWorth profile={profile} builders={builders} pipeline={pipeline} premium={premium} onUpgrade={openUpgrade} />}
     {screen === "community" && <Community builders={builders} pipeline={pipeline} squads={squads} onJoin={joinSquad} onLeave={leaveSquad} onForm={formSquad} culture={culture} />}
-    {screen === "alchemist" && <ExperienceAlchemist profile={profile} onBuildCV={() => setScreen("cvbuilder")} />}
-    {screen === "cvbuilder" && <CVBuilder profile={profile} saveCV={cv => setProfile(p => ({ ...p, cv }))} onBack={() => setScreen("alchemist")} />}
-    {screen === "settings" && <Settings builders={builders} onDelete={removeBuilder} onFairness={() => setScreen("fairness")} onAudit={() => setScreen("audit")} onReport={() => setScreen("report")} onEthics={() => setScreen("ethics")} logAudit={logAudit} premium={premium} onUpgrade={openUpgrade} onManage={manageSub} />}
+    {screen === "alchemist" && <ExperienceAlchemist profile={profile} onBuildCV={() => setScreen("cvbuilder")} onSave={(res, raw) => { setProfile(p => ({ ...p, experience: raw })); store.saveAlchemist(res).catch(() => {}); store.saveBuilderDocs({ experience: raw }).catch(() => {}); }} />}
+    {screen === "cvbuilder" && <CVBuilder profile={profile} saveCV={cv => { setProfile(p => ({ ...p, cv })); store.saveBuilderDocs({ cv }).catch(() => {}); }} onBack={() => setScreen("alchemist")} />}
+    {screen === "settings" && <Settings builders={builders} onDelete={removeBuilder} onFairness={() => setScreen("fairness")} onAudit={() => setScreen("audit")} onReport={() => setScreen("report")} onEthics={() => setScreen("ethics")} logAudit={logAudit} premium={premium} onUpgrade={openUpgrade} onManage={manageSub} onSignOut={onSignOut} />}
     {screen === "fairness" && <FairnessPosture onBack={() => setScreen("settings")} />}
     {screen === "audit" && <AuditTrail audit={audit} onBack={() => setScreen("settings")} />}
     {screen === "report" && <ReportIssue categories={REPORT_CATS_CANDIDATE} source="candidate" logAudit={logAudit} onBack={() => setScreen("settings")} />}
@@ -1704,7 +1718,7 @@ function useZuriVoice() {
     let handled = false;
     const goFallback = () => { if (handled) return; handled = true; cleanupAudio(); fallback(line); };
     try {
-      const res = await fetch("/api/tts", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text: line }) });
+      const res = await fetch(TTS_URL, { method: "POST", headers: await apiHeaders(), body: JSON.stringify({ text: line }) });
       if (!res.ok) throw new Error("tts " + res.status);
       const buf = await res.arrayBuffer();
       if (!buf.byteLength) throw new Error("empty audio");
@@ -2249,10 +2263,13 @@ function EmpDashboard({ company, onEngage }) {
   </div></Scroll>;
 }
 
-function EmployerApp({ builders, pipeline, setPipeline, logAudit, exit, toRole }) {
-  const [screen, setScreen] = useState(DEMO_SEED ? "app" : "welcome");
+function EmployerApp({ builders, pipeline, setPipeline, logAudit, exit, toRole, employer, fx, onSignOut }) {
+  // Session restore: a saved employer record skips onboarding and lands in-app.
+  const [screen, setScreen] = useState(DEMO_SEED ? "app" : employer ? "app" : "welcome");
   const [tab, setTab] = useState("dashboard");
-  const [company, setCompany] = useState(DEMO_SEED ? SEED_COMPANIES[0] : { name: "", domain: "", industry: "", size: "", country: "", hiringFor: "" });
+  const [company, setCompany] = useState(DEMO_SEED ? SEED_COMPANIES[0]
+    : employer ? { name: employer.name || "", domain: employer.domain || "", industry: employer.industry || "", size: employer.size || "", country: employer.country || "", hiringFor: employer.hiring_for || "" }
+    : { name: "", domain: "", industry: "", size: "", country: "", hiringFor: "" });
   const [active, setActive] = useState(null); const [sow, setSow] = useState(null);
   const toast = useToast();
   const inApp = screen === "app";
@@ -2277,19 +2294,19 @@ function EmployerApp({ builders, pipeline, setPipeline, logAudit, exit, toRole }
     {screen === "welcome" && <EmpWelcome onNext={() => setScreen("auth")} onBack={toRole} />}
     {screen === "auth" && <AuthFormPage role="employer" onBack={() => setScreen("welcome")} onAuthenticated={() => setScreen("company-info")} />}
     {screen === "company-info" && <EmpCompanyInfo company={company} setCompany={setCompany} onNext={() => setScreen("alignment")} onBack={() => setScreen("auth")} />}
-    {screen === "alignment" && <EmpAlignment onEnter={() => { setScreen("app"); setTab("dashboard"); }} onBack={() => setScreen("company-info")} />}
+    {screen === "alignment" && <EmpAlignment onEnter={() => { store.saveCompany(company).catch(() => {}); setScreen("app"); setTab("dashboard"); }} onBack={() => setScreen("company-info")} />}
     {inApp && tab === "dashboard" && <EmpDashboard company={company} onEngage={() => setTab("engage")} />}
     {inApp && tab === "engage" && <Search builders={builders} pipeline={pipeline} onShortlist={shortlist} onRequestInterview={requestInterview} saved={saved} onToggleSave={toggleSave} />}
     {inApp && tab === "pipeline" && <Pipeline pipeline={pipeline} move={move} openSow={openSow} />}
     {inApp && tab === "compliance" && <Compliance active={active} sow={sow} setSow={setSow} />}
-    {inApp && tab === "investments" && <Finance pipeline={pipeline} />}
+    {inApp && tab === "investments" && <Finance pipeline={pipeline} fx={fx} />}
     {inApp && tab === "saved" && <SavedBuilders saved={saved} pipeline={pipeline} onToggleSave={toggleSave} />}
     {inApp && tab === "team" && <MyTeam pipeline={pipeline} />}
     {inApp && tab === "trust" && <TrustSafety pipeline={pipeline} onFairness={() => setTab("fairness")} onReport={() => setTab("report")} onEthics={() => setTab("ethics")} />}
     {inApp && tab === "fairness" && <FairnessPosture onBack={() => setTab("trust")} />}
     {inApp && tab === "report" && <ReportIssue categories={REPORT_CATS_EMPLOYER} source="employer" logAudit={logAudit} onBack={() => setTab("trust")} />}
     {inApp && tab === "ethics" && <EthicsPage onBack={() => setTab("trust")} />}
-    {inApp && tab === "account" && <Account company={company} setCompany={setCompany} />}
+    {inApp && tab === "account" && <Account company={company} setCompany={c => { setCompany(c); store.saveCompany(c).catch(() => {}); }} onSignOut={onSignOut} />}
   </Shell>;
 }
 
@@ -2339,7 +2356,7 @@ function MyTeam({ pipeline }) {
 }
 
 // ---- Account (employer). NO MODEL. Editable company profile ----
-function Account({ company, setCompany }) {
+function Account({ company, setCompany, onSignOut }) {
   const toast = useToast();
   const [draft, setDraft] = useState(company);
   const set = (k, v) => setDraft(d => ({ ...d, [k]: v }));
@@ -2358,7 +2375,8 @@ function Account({ company, setCompany }) {
       </div>
       <Field label="Headquarters country" value={draft.country} onChange={v => set("country", v)} placeholder="Germany" />
     </Card>
-    <div style={{ marginTop: 16 }}><Btn disabled={!dirty} onClick={() => { setCompany(draft); toast("Account saved. Persistence is a backend step."); }}>Save changes</Btn></div>
+    <div style={{ marginTop: 16, display: "flex", gap: 12, alignItems: "center" }}><Btn disabled={!dirty} onClick={() => { setCompany(draft); toast("Account saved."); }}>Save changes</Btn>
+      {onSignOut && <Btn kind="ghost" small onClick={onSignOut}>Sign out</Btn>}</div>
     <div style={{ marginTop: 10, fontFamily: F.mono, fontSize: 11, color: T.slate }}>Company profile, billing, and verification run on the backend.</div>
     <div style={{ height: 14 }} />
     <Card><Label>Text size</Label>
@@ -2539,7 +2557,7 @@ function Compliance({ active, sow, setSow }) {
     try {
       const sys = "You are the Telos Compliance Agent, acting as Employer of Record for Fumana. Draft a concise Statement of Work for an enterprise client engaging a vetted builder through Fumana. Fumana acts as the IP custodian and as the legal Employer of Record, assuming local employment liability and tax remittance. Use general, honest language only. Do not assert specific tax rates and do not make jurisdiction-specific legal claims. Return ONLY JSON, no fences. Shape: {\"title\":string,\"scope\":[string],\"deliverables\":[string],\"ip_clause\":string,\"eor_note\":string,\"term\":string}. Keep each line tight. No em dashes.";
       const out = await callClaude({ system: sys, messages: [{ role: "user", content: `Builder: ${active.handle}, ${active.role}. Monthly USD ${active.monthlyUsd}. Context: ${active.summary}` }], expectJson: true });
-      setSow(out);
+      setSow(out); store.saveSow(active.handle, out).catch(() => {});
     } catch (e) {
       setErr(String(e).includes("501") ? "config" : "fail");
     }
@@ -2581,11 +2599,28 @@ const ImpactStat = ({ n, label, note }) => <div style={{ background: T.paper, bo
   <div style={{ fontFamily: F.mono, fontSize: 10.5, color: T.slate, marginTop: 3 }}>{note}</div>
 </div>;
 
-function Finance({ pipeline }) {
+// Beat 4: seeded FX rate, the canonical FxRate entity. Illustrative until live
+// rates are wired on the backend. The demo scenario is a Lagos builder paid in
+// USD, so the pair is USD/NGN.
+const BASE_FX = { pair: "USD/NGN", rate: 1550, symbol: "₦", illustrative: true };
+const RETENTION_PCT = 62; // share of local value that stays local, labelled assumption
+const ngn = n => "₦" + Math.round(n).toLocaleString("en-US");
+
+function Finance({ pipeline, fx }) {
+  // Seeded FX quote hydrated from fx_rates when the backend is configured;
+  // the labelled demo constant is the fallback.
+  const baseRate = fx?.rate ?? BASE_FX.rate;
   const [statutoryPct, setStatutoryPct] = useState(18);
   const [zBusy, setZBusy] = useState(false);
   const [zErr, setZErr] = useState("");
   const [zNote, setZNote] = useState("");
+  // Beat 4 currency move. `applied` holds the move once triggered; null is the
+  // baseline. Both states stay reachable and Reset restores the baseline.
+  const [movePct, setMovePct] = useState(20);
+  const [applied, setApplied] = useState(null);
+  const [fxBusy, setFxBusy] = useState(false);
+  const [fxErr, setFxErr] = useState("");
+  const [fxNarr, setFxNarr] = useState(null);
   const platformPct = 12; // Fumana platform fee, disclosed
   const team = pipeline.sow;
   if (team.length === 0) return <Scroll><div style={{ maxWidth: 760, margin: "0 auto" }} className="rise">
@@ -2600,10 +2635,18 @@ function Finance({ pipeline }) {
     return { c, monthly, platform, statutory, net: monthly - platform - statutory };
   });
   const sum = k => rows.reduce((s, r) => s + r[k], 0);
-  const totalMonthly = sum("monthly"), totalNet = sum("net");
-  const localRetained = Math.round(totalNet * 12 * 0.62); // illustrative annual local value retained
+  const totalMonthly = sum("monthly");
   const domestic = Math.round(totalMonthly * 2.4);        // illustrative domestic equivalent
   const saving = domestic - totalMonthly;
+  // Beat 4 SROI derivation (canonical SROIEntry): engagement -> FX rate ->
+  // gross local -> retention -> retained capital. Every figure computed here;
+  // the currency move below only re-runs this same math on a new rate.
+  const annualGross = totalMonthly * 12;
+  const fxRate = applied ? applied.rate : baseRate;
+  const grossLocal = Math.round(annualGross * fxRate);
+  const retainedLocal = Math.round(grossLocal * RETENTION_PCT / 100);
+  const baseGrossLocal = Math.round(annualGross * baseRate);
+  const baseRetained = Math.round(baseGrossLocal * RETENTION_PCT / 100);
 
   // Zuri marketplace economist (NEEDS MODEL): honest PPP-aware context on the
   // active engagement's role and budget. Routes through /api/claude; inert-aware.
@@ -2620,6 +2663,32 @@ function Finance({ pipeline }) {
     }
     setZBusy(false);
   }
+
+  // Beat 4 trigger: recompute the derivation in code first (instant, and the
+  // wow moment), then ask the two Telos agents to narrate the change. The calls
+  // carry narration only, per the computed-not-generated rule.
+  async function triggerMove() {
+    const pct = movePct;
+    const rate = Math.round(baseRate * (1 + pct / 100));
+    const afterGross = Math.round(annualGross * rate);
+    const afterRetained = Math.round(afterGross * RETENTION_PCT / 100);
+    setApplied({ pct, rate });
+    setFxNarr(null); setFxErr(""); setFxBusy(true);
+    const user = `Engagement: ${team.length} builder${team.length === 1 ? "" : "s"}, ${usd(totalMonthly)} / month (${usd(annualGross)} / year gross). Pair ${BASE_FX.pair}: currency move ${pct > 0 ? "+" : ""}${pct}%, rate ${baseRate} to ${rate}. Gross local value per year before ${ngn(baseGrossLocal)}, after ${ngn(afterGross)}. Retained local capital at ${RETENTION_PCT}% retention before ${ngn(baseRetained)}, after ${ngn(afterRetained)}.`;
+    const econSys = "You are the Telos Economics Agent for Fumana. A currency move has just re-priced the local-currency value of a USD-denominated engagement. In three or four plain sentences, state what the move does to the local value and retained capital, what it means in purchasing-power terms for the builder, and one honest caveat. Speak in ranges, reference only the figures provided, and never present a number as settled fact. No hype, no flattery, no em dashes, sentence case.";
+    const compSys = "You are the Telos Compliance Agent for Fumana, acting as Employer of Record. A currency move has just re-priced the local-currency value of an engagement whose contract is denominated in USD. In two or three plain sentences, state what the move means for the employer obligation, how local remittance amounts adjust at payment time, and whether any term needs redrafting. General honest language only: no jurisdiction-specific legal claims and no asserted tax rates. No em dashes, sentence case.";
+    try {
+      const [econ, comp] = await Promise.all([
+        callClaude({ system: econSys, messages: [{ role: "user", content: user }], expectJson: false }),
+        callClaude({ system: compSys, messages: [{ role: "user", content: user }], expectJson: false }),
+      ]);
+      setFxNarr({ econ, comp });
+    } catch (e) {
+      setFxErr(String(e).includes("501") ? "config" : "fail");
+    }
+    setFxBusy(false);
+  }
+  function resetMove() { setApplied(null); setFxNarr(null); setFxErr(""); }
 
   return <Scroll><div style={{ maxWidth: 900, margin: "0 auto" }} className="rise">
     <Eyebrow>Investments</Eyebrow>
@@ -2660,12 +2729,49 @@ function Finance({ pipeline }) {
       <Label>SROI Ledger</Label>
       <p style={{ fontSize: 13.5, color: T.slate, margin: "8px 0 14px" }}>Auditable social return on investment, tracked against SDG 8, 9, and 17. Powered by the Global Impact Commons. Maintained by Lexington Advisory Group.</p>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(165px, 1fr))", gap: 12 }}>
-        <ImpactStat n={usd(localRetained)} label="Local capital retained / yr" note={`net pay ${usd(totalNet)} × 12 × 62% retention`} />
+        <ImpactStat n={ngn(retainedLocal)} label="Local capital retained / yr" note={`gross ${usd(annualGross)} × ₦${fxRate.toLocaleString("en-US")} × ${RETENTION_PCT}% retention`} />
         <ImpactStat n={team.length} label={`builder${team.length === 1 ? "" : "s"} engaged`} note="active SOW engagements" />
         <ImpactStat n={usd(totalMonthly)} label="Total monthly commitment" note="sum of engagement budgets" />
       </div>
       <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 14 }}>{["SDG 8", "SDG 9", "SDG 17"].map(s => <span key={s} style={{ fontFamily: F.mono, fontSize: 11, color: T.emerald, border: `1px solid ${T.line}`, borderRadius: 4, padding: "2px 8px" }}>{s}</span>)}</div>
       <div style={{ marginTop: 12, fontFamily: F.mono, fontSize: 11, color: T.slate, lineHeight: 1.6 }}>Sourcing: computed in code from the fee waterfall figures above, not model-generated and not certified impact accounting. The 62% retention factor and the SDG mappings are labelled assumptions.</div>
+    </Card></div>
+
+    <div style={{ marginTop: 16 }}><Card accent={applied ? T.brass : T.emerald}>
+      <Label>Currency derivation</Label>
+      <p style={{ fontSize: 13.5, color: T.slate, margin: "8px 0 14px" }}>The SROI derivation, row by row. Computed in code from the engagement and a seeded {BASE_FX.pair} rate; the rate is illustrative until live rates are wired on the backend.</p>
+      <div style={{ display: "grid", gap: 1, background: T.line, border: `1px solid ${T.line}`, borderRadius: 8, overflow: "hidden" }}>
+        {[
+          { k: "Engagement, annual gross", v: usd(annualGross), note: `${usd(totalMonthly)} / mo × 12` },
+          { k: `FX rate ${BASE_FX.pair}`, v: "₦" + fxRate.toLocaleString("en-US"), was: applied ? "₦" + baseRate.toLocaleString("en-US") : null, note: fx ? `rate as of ${String(fx.as_of || "").slice(0, 10)}, illustrative` : "seeded demo rate, illustrative" },
+          { k: "Gross local value / yr", v: ngn(grossLocal), was: applied ? ngn(baseGrossLocal) : null, note: "engagement × rate" },
+          { k: "Retention assumption", v: RETENTION_PCT + "%", note: "share of local value that stays local" },
+          { k: "Retained capital / yr", v: ngn(retainedLocal), was: applied ? ngn(baseRetained) : null, note: "gross local × retention" },
+        ].map((r, j) => <div key={j} style={{ background: T.surface, padding: "12px 14px", display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12 }}>
+          <div><div style={{ fontSize: 14, color: T.ink, fontWeight: 600 }}>{r.k}</div><div style={{ fontFamily: F.mono, fontSize: 10.5, color: T.slate, marginTop: 2 }}>{r.note}</div></div>
+          <div style={{ fontFamily: F.mono, fontSize: 15, textAlign: "right", whiteSpace: "nowrap" }}>{r.was && <span style={{ color: T.slate, fontSize: 12 }}>{r.was} → </span>}<span style={{ color: r.was ? T.emerald : T.ink }}>{r.v}</span></div>
+        </div>)}
+      </div>
+
+      {applied && <div style={{ marginTop: 12, background: T.paper, border: `1px solid ${T.brass}`, borderRadius: 8, padding: "10px 12px", fontSize: 13, color: T.slate }}>
+        Currency move applied: <b style={{ color: T.ink }}>{applied.pct > 0 ? "+" : ""}{applied.pct}%</b> on {BASE_FX.pair}. Retained capital moved <span style={{ fontFamily: F.mono, color: retainedLocal >= baseRetained ? T.emerald : T.alert }}>{retainedLocal >= baseRetained ? "+" : "-"}{ngn(Math.abs(retainedLocal - baseRetained))}</span> per year.
+      </div>}
+
+      <div style={{ marginTop: 14, display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+        <label style={{ fontFamily: F.mono, fontSize: 11, color: T.slateLg, textTransform: "uppercase", letterSpacing: 0.3 }}>Currency move <span style={{ color: T.ink }}>{movePct > 0 ? "+" : ""}{movePct}%</span></label>
+        <input aria-label="Currency move percent" type="range" min="-40" max="40" step="5" value={movePct} onChange={e => setMovePct(Number(e.target.value))} style={{ flex: 1, minWidth: 140, accentColor: T.emerald }} />
+        {fxBusy ? <Spinner label="The Telos agents are re-deriving the impact..." /> : <Btn small onClick={triggerMove}>Trigger currency move</Btn>}
+        {applied && !fxBusy && <Btn small kind="ghost" onClick={resetMove}>Reset to baseline</Btn>}
+      </div>
+
+      {fxErr === "config" && <p style={{ marginTop: 12, fontSize: 13.5, color: T.slate }}>The figures above re-derived in code. The two agents' narration lights up the moment a model provider is connected.</p>}
+      {fxErr === "fail" && <div style={{ marginTop: 12, color: T.alert, fontSize: 14, display: "flex", gap: 12, alignItems: "center" }}>The agents did not respond. <Btn kind="ghost" small onClick={triggerMove}>Try again</Btn></div>}
+      {fxNarr && <div style={{ marginTop: 14 }}>
+        <Mini label="Economics Agent" body={fxNarr.econ} />
+        <Mini label="Compliance Agent" body={fxNarr.comp} />
+        <div style={{ marginTop: 10, fontFamily: F.mono, fontSize: 10.5, color: T.slate }}>The agents narrate the re-derivation. No figure in their text is model-generated.</div>
+      </div>}
+      <div style={{ marginTop: 12, fontFamily: F.mono, fontSize: 11, color: T.slate, lineHeight: 1.6 }}>Before and after stay visible side by side; Reset returns to the seeded baseline. Mapped to SDG 8, 9, and 17.</div>
     </Card></div>
 
     <div style={{ marginTop: 16 }}><Card accent={zNote ? T.emerald : T.line}>
@@ -2800,16 +2906,70 @@ export default function App() {
   const [pipeline, setPipeline] = useState(DEMO_SEED ? SEED_PIPELINE : { shortlisted: [], interviewing: [], sow: [] });
   const [squads, setSquads] = useState(SEED_SQUADS);
   const [audit, setAudit] = useState([]);
-  const logAudit = e => setAudit(a => [{ ...e, at: Date.now() }, ...a]);
-  const addBuilder = b => setBuilders(prev => [b, ...prev]);
+  // The signed-in user's own builder record and employer org, when a backend
+  // is configured. Drives session restore on both portals.
+  const [me, setMe] = useState(null);
+  const [myEmployer, setMyEmployer] = useState(null);
+  const [fx, setFx] = useState(null);
+
+  // Hydrate the shared store from Supabase when configured. Without a backend
+  // (or on any failure) the seeded in-memory state stays — demo posture is
+  // unchanged and nothing in the UI can tell the difference.
+  // Collections merge rather than replace: anything the user created locally
+  // while the network call was in flight is kept, so a slow hydrate cannot
+  // clobber a just-finished assessment or squad.
+  useEffect(() => {
+    let live = true;
+    store.loadNetwork()
+      .then(net => {
+        if (!live || !net) return;
+        setBuilders(prev => {
+          const local = new Map(prev.map(b => [b.id || b.handle, b]));
+          for (const r of net.builders) { const k = r.id || r.handle; if (!local.has(k)) local.set(k, r); }
+          return [...local.values()];
+        });
+        setPipeline(prev => Object.values(prev).some(s => s.length) ? prev : net.pipeline);
+        setSquads(prev => {
+          const seen = new Set(prev.map(s => s.id));
+          const merged = prev.map(s => {
+            const remote = net.squads.find(n => n.id === s.id);
+            return remote ? { ...remote, joined: s.joined } : s;
+          });
+          return [...merged, ...net.squads.filter(n => !seen.has(n.id))];
+        });
+        setAudit(prev => {
+          const seen = new Set(prev.map(e => `${e.kind}:${e.at}`));
+          return [...prev, ...net.audit.filter(e => !seen.has(`${e.kind}:${e.at}`))];
+        });
+        if (net.fx) setFx(net.fx);
+        setMe(net.me ? { ...net.me, docs: net.docs } : null);
+        setMyEmployer(net.employer || null);
+      })
+      .catch(() => {});
+    return () => { live = false; };
+  }, []);
+
+  // Every mutation writes through to the store. Each store call no-ops without
+  // a backend, so these stay correct in both postures.
+  const logAudit = e => { setAudit(a => [{ ...e, at: Date.now() }, ...a]); store.logAudit(e).catch(() => {}); };
+  const addBuilder = b => { setBuilders(prev => [b, ...prev]); store.addBuilder(b).catch(() => {}); };
   // Data deletion: remove the builder from the shared network store, so the
   // profile stops appearing in employer search and in Community. This is what
   // makes "delete my data" a real removal rather than a logged intention.
-  const removeBuilder = handle => setBuilders(prev => prev.filter(b => b.handle !== handle));
-  const joinSquad = id => setSquads(s => s.map(x => x.id === id ? { ...x, joined: true, members: x.members + 1 } : x));
-  const leaveSquad = id => setSquads(s => s.map(x => x.id === id ? { ...x, joined: false, members: Math.max(0, x.members - 1) } : x));
-  const formSquad = ({ name, focus, pitch }) => setSquads(s => [{ id: "sq-" + Math.random().toString(36).slice(2, 8), name, focus, pitch, members: 1, joined: true }, ...s]);
+  const removeBuilder = handle => { setBuilders(prev => prev.filter(b => b.handle !== handle)); store.removeBuilder(handle).catch(() => {}); };
+  const joinSquad = id => { setSquads(s => s.map(x => x.id === id ? { ...x, joined: true, members: x.members + 1 } : x)); store.joinSquad(id).catch(() => {}); };
+  const leaveSquad = id => { setSquads(s => s.map(x => x.id === id ? { ...x, joined: false, members: Math.max(0, x.members - 1) } : x)); store.leaveSquad(id).catch(() => {}); };
+  const formSquad = ({ name, focus, pitch }) => { const id = "sq-" + Math.random().toString(36).slice(2, 8); setSquads(s => [{ id, name, focus, pitch, members: 1, joined: true }, ...s]); store.formSquad({ id, name, focus, pitch }).catch(() => {}); };
+  // Pipeline edits arrive as updater fns from EmployerApp; resolve then persist.
+  const setPipelinePersist = updater => setPipeline(prev => {
+    const next = typeof updater === "function" ? updater(prev) : updater;
+    store.savePipeline(next).catch(() => {});
+    return next;
+  });
   const toRole = () => setView("role");
+  // Real sign-out: clears the Supabase session token and the restored
+  // identities so the next visit starts signed out, then lands home.
+  const signOut = () => { authSignOut().finally(() => { setMe(null); setMyEmployer(null); setView("landing"); }); };
   const [fontSize, setFontSize] = useState("default");
   const scale = FONT_SCALE[fontSize] || 1;
   // The marketing views (landing, role selection) are Tailwind-styled and use
@@ -2822,8 +2982,8 @@ export default function App() {
         <HumanReviewProvider logAudit={logAudit}>
           {view === "landing" && <div style={marketingFont}><LandingPage onSignInClick={toRole} /></div>}
           {view === "role" && <div style={marketingFont}><RoleSelectionPage onRoleSelect={r => setView(r === "builder" ? "candidate" : "employer")} onBack={() => setView("landing")} /></div>}
-          {view === "candidate" && <CandidateApp addBuilder={addBuilder} removeBuilder={removeBuilder} builders={builders} pipeline={pipeline} squads={squads} joinSquad={joinSquad} leaveSquad={leaveSquad} formSquad={formSquad} audit={audit} logAudit={logAudit} exit={() => setView("landing")} toRole={toRole} />}
-          {view === "employer" && <EmployerApp builders={builders} pipeline={pipeline} setPipeline={setPipeline} logAudit={logAudit} exit={() => setView("landing")} toRole={toRole} />}
+          {view === "candidate" && <CandidateApp addBuilder={addBuilder} removeBuilder={removeBuilder} builders={builders} pipeline={pipeline} squads={squads} joinSquad={joinSquad} leaveSquad={leaveSquad} formSquad={formSquad} audit={audit} logAudit={logAudit} exit={() => setView("landing")} toRole={toRole} me={me} onSignOut={signOut} />}
+          {view === "employer" && <EmployerApp builders={builders} pipeline={pipeline} setPipeline={setPipelinePersist} logAudit={logAudit} exit={() => setView("landing")} toRole={toRole} employer={myEmployer} fx={fx} onSignOut={signOut} />}
         </HumanReviewProvider>
       </ToastProvider>
     </FontSizeCtx.Provider>
