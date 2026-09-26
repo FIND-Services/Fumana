@@ -163,6 +163,91 @@ export function AuthFormPage({ role, onBack, onAuthenticated }: { role: string; 
   );
 }
 
+// --- PASSWORD RESET LANDING ---
+// Supabase recovery links land back on the app with a recovery session. This
+// screen collects the new password and calls updateUser against it.
+export function ResetPasswordPage({ onDone }: { onDone: () => void }) {
+  const [pw, setPw] = useState('');
+  const [pw2, setPw2] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [done, setDone] = useState(false);
+
+  async function submit(e: React.FormEvent) {
+    e.preventDefault();
+    if (pw.length < 8) { setError('Use at least 8 characters.'); return; }
+    if (pw !== pw2) { setError('Passwords do not match.'); return; }
+    if (!supabase) { setError('Password reset needs a configured backend.'); return; }
+    setBusy(true); setError('');
+    const { error: err } = await supabase.auth.updateUser({ password: pw });
+    setBusy(false);
+    if (err) { setError(err.message); return; }
+    setDone(true);
+  }
+
+  return (
+    <div className="min-h-screen flex flex-col bg-[#F2F4F7]">
+      <div className="flex-1 flex items-center justify-center p-6">
+        <div className="bg-[#FFFFFF] border border-[#D7DEE3] w-full max-w-md shadow-sm">
+          <div className="p-8 border-b border-[#D7DEE3] text-center">
+            <div className="flex items-center justify-center space-x-2 mb-6">
+              <div className="w-4 h-4 bg-[#0C1A26]"></div>
+              <span className="font-semibold text-xl tracking-tight text-[#0C1A26]">FUMANA</span>
+            </div>
+            <h2 className="text-2xl font-semibold text-[#0C1A26] mb-2">
+              {done ? 'Password updated' : 'Set a new password'}
+            </h2>
+          </div>
+          <div className="p-8 space-y-6">
+            {done ? (
+              <>
+                <p className="text-sm text-[#5E6E7A]">Your password has been changed. Sign in with the new password.</p>
+                <button onClick={onDone} className="w-full bg-[#066E5A] text-[#F4F7F8] p-3 font-medium hover:bg-[#05564A] transition-colors">
+                  Continue to sign in
+                </button>
+              </>
+            ) : (
+              <form className="space-y-4" onSubmit={submit}>
+                <div className="space-y-1">
+                  <label className="font-['IBM_Plex_Mono',monospace] text-xs text-[#5E6E7A] uppercase">New Password</label>
+                  <input
+                    type="password"
+                    required
+                    value={pw}
+                    onChange={(e) => setPw(e.target.value)}
+                    className="w-full bg-[#FFFFFF] border border-[#D7DEE3] p-3 text-[#0C1A26] focus:border-[#066E5A] outline-none transition-colors"
+                    placeholder="At least 8 characters"
+                  />
+                </div>
+                <div className="space-y-1">
+                  <label className="font-['IBM_Plex_Mono',monospace] text-xs text-[#5E6E7A] uppercase">Confirm Password</label>
+                  <input
+                    type="password"
+                    required
+                    value={pw2}
+                    onChange={(e) => setPw2(e.target.value)}
+                    className="w-full bg-[#FFFFFF] border border-[#D7DEE3] p-3 text-[#0C1A26] focus:border-[#066E5A] outline-none transition-colors"
+                    placeholder="Repeat it"
+                  />
+                </div>
+                {error && (
+                  <p className="font-['IBM_Plex_Mono',monospace] text-xs text-[#A03020] leading-relaxed">{error}</p>
+                )}
+                <button type="submit" disabled={busy} className="w-full bg-[#066E5A] text-[#F4F7F8] p-3 font-medium hover:bg-[#05564A] transition-colors mt-2 disabled:opacity-60">
+                  {busy ? 'Working…' : 'Update password'}
+                </button>
+              </form>
+            )}
+          </div>
+        </div>
+      </div>
+      <footer className="p-4 text-center font-['IBM_Plex_Mono',monospace] text-[11px] text-[#5E6E7A]">
+        &copy; FIND Services Limited. Powered by Telos. Designed by Lexington Advisory Group.
+      </footer>
+    </div>
+  );
+}
+
 // --- ROLE SELECTION VIEW ---
 export function RoleSelectionPage({ onRoleSelect, onBack }: { onRoleSelect: (role: string) => void; onBack: () => void }) {
   return (

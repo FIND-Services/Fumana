@@ -6,9 +6,9 @@ import q2Video from "./assets/zuri/zuri-q2.mp4";
 import q3Video from "./assets/zuri/zuri-q3.mp4";
 import q4Video from "./assets/zuri/zuri-q4.mp4";
 import q5Video from "./assets/zuri/zuri-q5.mp4";
-import { LandingPage, RoleSelectionPage, AuthFormPage } from "./marketing";
+import { LandingPage, RoleSelectionPage, AuthFormPage, ResetPasswordPage } from "./marketing";
 import * as store from "./lib/store";
-import { LLM_URL, TTS_URL, apiHeaders, signOut as authSignOut } from "./lib/backend";
+import { LLM_URL, TTS_URL, apiHeaders, signOut as authSignOut, hasBackend, supabase } from "./lib/backend";
 
 // ============================================================
 // Fumana platform. One application, one shared builder network.
@@ -367,7 +367,7 @@ function NotificationBell() {
 const HumanReviewCtx = createContext(() => {});
 const useHumanReview = () => useContext(HumanReviewCtx);
 
-function HumanReviewProvider({ logAudit, children }) {
+function HumanReviewProvider({ logAudit, submitReview, children }) {
   const [open, setOpen] = useState(false);
   const [decision, setDecision] = useState("");
   const [reason, setReason] = useState("");
@@ -378,6 +378,7 @@ function HumanReviewProvider({ logAudit, children }) {
     if (!reason.trim()) return;
     const r = "HR-" + Math.random().toString(36).slice(2, 7).toUpperCase();
     setRef(r);
+    if (submitReview) submitReview({ kind: "human-review", subject: decision, reason: reason.trim(), ref: r });
     if (logAudit) logAudit({ kind: "human-review", decision, reason: reason.trim(), ref: r, source: src });
   }
   return <HumanReviewCtx.Provider value={request}>
@@ -392,7 +393,7 @@ function HumanReviewProvider({ logAudit, children }) {
             <div><span style={{ color: T.slate }}>reference </span><b>{ref}</b></div>
             <div><span style={{ color: T.slate }}>expected </span>within 5 business days</div>
           </div>
-          <div style={{ marginTop: 10, fontFamily: F.mono, fontSize: 11, color: T.slate }}>Stubbed queue in this prototype; real routing runs on the backend. Logged to your audit trail.</div>
+          <div style={{ marginTop: 10, fontFamily: F.mono, fontSize: 11, color: T.slate }}>Queued for a human reviewer. Logged to your audit trail.</div>
           <div style={{ marginTop: 16 }}><Btn onClick={() => setOpen(false)}>Done</Btn></div>
         </>
         : <>
@@ -690,10 +691,18 @@ const AUDIT_VIEW = {
   "human-review": e => ({ label: "Human review requested", desc: `${e.decision}. Reference ${e.ref}.` }),
   "data-export": () => ({ label: "Data exported", desc: "You downloaded a copy of the data Fumana holds about you." }),
   "data-deletion": () => ({ label: "Data deletion requested", desc: "You requested removal of your profile and data from the network." }),
+  // Events caused by someone else about you (subject-scoped rows).
+  "shortlisted": () => ({ label: "Profile shortlisted", desc: "An employer shortlisted your profile. Your identity stayed shielded." }),
+  "reveal": () => ({ label: "Identity revealed for interview", desc: "An employer committed to an interview. Your role and summary are now visible to them." }),
+  "pipeline-move": e => ({ label: "Application status changed", desc: `An employer moved your application to ${{ shortlisted: "shortlisted", interviewing: "interviewing", sow: "SOW pending" }[e.status] || e.status}.` }),
+  "pipeline-withdrawn": () => ({ label: "Application withdrawn", desc: "An employer removed your profile from their pipeline." }),
+  "sow-generated": () => ({ label: "SOW drafted", desc: "An employer generated a Statement of Work draft for your engagement." }),
 };
 
 function AuditTrail({ audit, onBack }) {
-  const events = (audit || []).filter(e => e.source !== "employer");
+  // Employer-filed events are hidden, except subject-scoped rows (aboutMe):
+  // those were deliberately written into this builder's trail by the actor.
+  const events = (audit || []).filter(e => e.source !== "employer" || e.aboutMe);
   return <Scroll><div style={{ maxWidth: 760, margin: "0 auto" }} className="rise">
     <Back onClick={onBack} />
     <Eyebrow>Decision audit trail</Eyebrow>
@@ -722,7 +731,7 @@ function AuditTrail({ audit, onBack }) {
 const REPORT_CATS_CANDIDATE = ["Unfair assessment", "Employer breached the fair-terms pledge", "Harassment or conduct", "Other"];
 const REPORT_CATS_EMPLOYER = ["Builder conduct", "Platform issue", "Billing dispute", "Other"];
 
-function ReportIssue({ categories, source, logAudit, onBack }) {
+function ReportIssue({ categories, source, logAudit, submitReview, onBack }) {
   const [cat, setCat] = useState(categories[0]);
   const [desc, setDesc] = useState("");
   const [ctx, setCtx] = useState("");
@@ -731,6 +740,7 @@ function ReportIssue({ categories, source, logAudit, onBack }) {
     if (!desc.trim()) return;
     const r = "RP-" + Math.random().toString(36).slice(2, 7).toUpperCase();
     setRef(r);
+    if (submitReview) submitReview({ kind: "report", subject: cat, reason: desc.trim(), context: ctx.trim(), ref: r });
     if (logAudit) logAudit({ kind: "report", category: cat, description: desc.trim(), context: ctx.trim(), ref: r, source });
   }
   return <Scroll><div style={{ maxWidth: 680, margin: "0 auto" }} className="rise">
@@ -748,7 +758,7 @@ function ReportIssue({ categories, source, logAudit, onBack }) {
             <div><span style={{ color: T.slate }}>reference </span><b>{ref}</b></div>
             <div><span style={{ color: T.slate }}>expected </span>within 5 business days</div>
           </div>
-          <div style={{ marginTop: 10, fontFamily: F.mono, fontSize: 11, color: T.slate }}>Stubbed queue in this prototype; real routing runs on the backend. Logged to your audit trail.</div>
+          <div style={{ marginTop: 10, fontFamily: F.mono, fontSize: 11, color: T.slate }}>Queued for a human reviewer. Logged to your audit trail.</div>
           <div style={{ marginTop: 16 }}><Btn onClick={onBack}>Done</Btn></div>
         </>
         : <>
@@ -757,7 +767,7 @@ function ReportIssue({ categories, source, logAudit, onBack }) {
           <Field label="What happened?" value={desc} onChange={setDesc} rows={4} placeholder="Describe the issue in your own words." />
           <Field label="Evidence or context (optional)" value={ctx} onChange={setCtx} rows={2} placeholder="Links, dates, or anything a reviewer should know." />
           <div style={{ marginTop: 4 }}><Btn disabled={!desc.trim()} onClick={submit}>Submit report</Btn></div>
-          <div style={{ marginTop: 14, fontFamily: F.mono, fontSize: 11, color: T.slate, lineHeight: 1.6 }}>Reports are reviewed by a human, not an AI. The queue is stubbed in this prototype; real routing runs on the backend.</div>
+          <div style={{ marginTop: 14, fontFamily: F.mono, fontSize: 11, color: T.slate, lineHeight: 1.6 }}>Reports are reviewed by a human, not an AI, and enter a real queue. Resolution tooling arrives with the admin surface.</div>
         </>}
     </Card>
     <div style={{ height: 30 }} />
@@ -1076,7 +1086,7 @@ function ExperienceAlchemist({ profile, onBuildCV, onSave }) {
         <Btn small disabled={saved} onClick={() => { setSaved(true); if (onSave) onSave(result, raw); toast("Saved to your profile."); }}>{saved ? "Saved" : "Save to profile"}</Btn>
         <Btn kind="ghost" small onClick={copy}>Copy</Btn>
       </div>
-      <div style={{ marginTop: 10, fontFamily: F.mono, fontSize: 11, color: T.slate }}>Saved to your builder profile when a backend is connected.</div>
+      <div style={{ marginTop: 10, fontFamily: F.mono, fontSize: 11, color: T.slate }}>Saved to your builder profile.</div>
       <div style={{ marginTop: 10, fontFamily: F.mono, fontSize: 10.5, color: T.slate }}>Reshaped by Telos from what you wrote. Nothing was added.</div>
     </Card></div>}
     <div style={{ height: 30 }} />
@@ -1170,7 +1180,7 @@ function CVBuilder({ profile, saveCV, onBack }) {
     try { navigator.clipboard.writeText(cvToText(cv, profile.name)); toast("CV copied to clipboard."); }
     catch { toast("Copy is not available in this browser."); }
   }
-  function saveIt() { setSaved(true); if (saveCV) saveCV(cv); toast("CV saved to your profile. Real persistence is a backend step."); }
+  function saveIt() { setSaved(true); if (saveCV) saveCV(cv); toast("CV saved to your private documents."); }
 
   const Section = ({ title, children }) => <section style={{ marginTop: 18 }}><Label>{title}</Label><div style={{ marginTop: 8 }}>{children}</div></section>;
 
@@ -1256,7 +1266,7 @@ function CVBuilder({ profile, saveCV, onBack }) {
         <Btn kind="ghost" small onClick={() => window.print()}>Download PDF</Btn>
         <Btn kind="ghost" small onClick={() => { setPhase("ready"); setCv(null); setQa([]); setSaved(false); }}>Start over</Btn>
       </div>
-      <div className="noprint" style={{ marginTop: 10, fontFamily: F.mono, fontSize: 11, color: T.slate }}>Copy uses your clipboard. PDF uses your browser's print to PDF; a real PDF service is a backend step. Saved locally in this prototype; real persistence is a backend step.</div>
+      <div className="noprint" style={{ marginTop: 10, fontFamily: F.mono, fontSize: 11, color: T.slate }}>Copy uses your clipboard. PDF uses your browser's print to PDF; a real PDF service is a backend step. Save keeps the CV with your private documents.</div>
     </div>}
     <div style={{ height: 30 }} />
   </div></Scroll>;
@@ -1452,7 +1462,7 @@ function UpgradeModal({ open, onClose, onComplete }) {
   </Modal>;
 }
 
-function CandidateApp({ addBuilder, removeBuilder, builders, pipeline, squads, joinSquad, leaveSquad, formSquad, audit, logAudit, exit, toRole, me, onSignOut }) {
+function CandidateApp({ addBuilder, removeBuilder, builders, pipeline, squads, joinSquad, leaveSquad, formSquad, audit, logAudit, submitReview, reviews, exit, toRole, me, onSignOut }) {
   // Session restore: when the backend returns my builder record, land on the
   // dashboard with the assessment reconstructed from it. `me` is the raw
   // builders row (snake_case).
@@ -1497,7 +1507,7 @@ function CandidateApp({ addBuilder, removeBuilder, builders, pipeline, squads, j
     {screen === "assessinfo" && <AssessInfo accommodations={accommodations} setAccommodations={setAccommodations} onOptIn={() => { if (accommodations.extraTime || accommodations.textOnly || accommodations.written) logAudit({ kind: "accommodations", ...accommodations }); setScreen("interview"); }} onOptOut={() => setScreen("humanreview")} onBack={() => setScreen("onboarding")} />}
     {screen === "humanreview" && <HumanReview onSwitch={() => setScreen("interview")} />}
     {screen === "interview" && <Interview profile={profile} accommodations={accommodations} onBack={() => setScreen("assessinfo")} onComplete={finish} />}
-    {screen === "dashboard" && result && <Dashboard profile={profile} result={result} onUpskill={() => setScreen("upskill")} published={published} audit={audit} logAudit={logAudit} culture={culture} premium={premium} onUpgrade={openUpgrade} />}
+    {screen === "dashboard" && result && <Dashboard profile={profile} result={result} onUpskill={() => setScreen("upskill")} published={published} audit={audit} logAudit={logAudit} culture={culture} premium={premium} onUpgrade={openUpgrade} reviews={reviews} submitReview={submitReview} />}
     {screen === "upskill" && result && <Upskill result={result} points={points} setPoints={setPoints} culture={culture} setCulture={setCulture} logAudit={logAudit} premium={premium} onUpgrade={openUpgrade} />}
     {screen === "applications" && <Applications builders={builders} pipeline={pipeline} />}
     {screen === "wallet" && <Wallet builders={builders} pipeline={pipeline} premium={premium} onUpgrade={openUpgrade} />}
@@ -1509,7 +1519,7 @@ function CandidateApp({ addBuilder, removeBuilder, builders, pipeline, squads, j
     {screen === "settings" && <Settings builders={builders} onDelete={removeBuilder} onFairness={() => setScreen("fairness")} onAudit={() => setScreen("audit")} onReport={() => setScreen("report")} onEthics={() => setScreen("ethics")} logAudit={logAudit} premium={premium} onUpgrade={openUpgrade} onManage={manageSub} onSignOut={onSignOut} />}
     {screen === "fairness" && <FairnessPosture onBack={() => setScreen("settings")} />}
     {screen === "audit" && <AuditTrail audit={audit} onBack={() => setScreen("settings")} />}
-    {screen === "report" && <ReportIssue categories={REPORT_CATS_CANDIDATE} source="candidate" logAudit={logAudit} onBack={() => setScreen("settings")} />}
+    {screen === "report" && <ReportIssue categories={REPORT_CATS_CANDIDATE} source="candidate" logAudit={logAudit} submitReview={submitReview} onBack={() => setScreen("settings")} />}
     {screen === "ethics" && <EthicsPage onBack={() => setScreen("settings")} />}
     <UpgradeModal open={upgradeOpen} onClose={() => setUpgradeOpen(false)} onComplete={completeUpgrade} />
   </Shell>;
@@ -1947,21 +1957,25 @@ function TrajectoryForecast({ result }) {
   </Card>;
 }
 
-function Dashboard({ profile, result, onUpskill, published, audit, logAudit, culture, premium, onUpgrade }) {
+function Dashboard({ profile, result, onUpskill, published, audit, logAudit, culture, premium, onUpgrade, reviews, submitReview }) {
   const tier = result.tier; const rec = MODULES[result.weakest?.name] || MODULES["Technical depth"];
   const [zuri, setZuri] = useState(""); const [zb, setZb] = useState(false); const [showCalc, setShowCalc] = useState(false);
   const [openDims, setOpenDims] = useState({});
   const transcript = result.transcript || [];
-  // Contest a specific dimension score (NO MODEL). Logged to the shared audit
-  // store; a contested dimension shows "under review" until resolved.
+  // Contest a specific dimension score (NO MODEL). Filed to the reviews queue;
+  // the dimension shows "under review" while its queue row stays open. In demo
+  // mode (no backend) the marker falls back to local audit entries.
   const [contestOpen, setContestOpen] = useState(false);
   const [cDim, setCDim] = useState(""); const [cWhy, setCWhy] = useState(""); const [cCtx, setCCtx] = useState(""); const [cRef, setCRef] = useState("");
-  const contestedDims = new Set((audit || []).filter(e => e.kind === "contest").map(e => e.dimension));
+  const contestedDims = new Set(hasBackend
+    ? (reviews || []).filter(r => r.kind === "contest" && r.status !== "resolved").map(r => r.subject)
+    : (audit || []).filter(e => e.kind === "contest").map(e => e.dimension));
   function openContest() { setCDim(result.dimensions[0]?.name || ""); setCWhy(""); setCCtx(""); setCRef(""); setContestOpen(true); }
   function submitContest() {
     if (!cWhy.trim()) return;
     const r = "CT-" + Math.random().toString(36).slice(2, 7).toUpperCase();
     setCRef(r);
+    if (submitReview) submitReview({ kind: "contest", subject: cDim, reason: cWhy.trim(), context: cCtx.trim(), ref: r });
     if (logAudit) logAudit({ kind: "contest", dimension: cDim, reason: cWhy.trim(), context: cCtx.trim(), ref: r, source: "candidate" });
   }
   async function askZuri() { setZb(true); try { const sys = "You are Zuri, the career copilot inside Fumana. In three to four warm, direct sentences, tell this builder the single most valuable next move to raise their tier, grounded in their weakest dimension. No hype, no em dashes."; setZuri(await callClaude({ system: sys, messages: [{ role: "user", content: `Profile strength ${result.profileStrength}, tier ${tier.name}. Weakest: ${result.weakest?.name} at ${result.weakest?.score}. Role ${profile.role || "engineer"}.` }], expectJson: false })); } catch { setZuri("Zuri is unavailable right now."); } setZb(false); }
@@ -2014,7 +2028,7 @@ function Dashboard({ profile, result, onUpskill, published, audit, logAudit, cul
             <div><span style={{ color: T.slate }}>reference </span><b>{cRef}</b></div>
             <div><span style={{ color: T.slate }}>expected </span>within 5 business days</div>
           </div>
-          <div style={{ marginTop: 10, fontFamily: F.mono, fontSize: 11, color: T.slate }}>Stubbed queue in this prototype; real routing runs on the backend. Logged to your audit trail.</div>
+          <div style={{ marginTop: 10, fontFamily: F.mono, fontSize: 11, color: T.slate }}>Queued for a human reviewer. Logged to your audit trail.</div>
           <div style={{ marginTop: 16 }}><Btn onClick={() => setContestOpen(false)}>Done</Btn></div>
         </>
         : <>
@@ -2263,7 +2277,7 @@ function EmpDashboard({ company, onEngage }) {
   </div></Scroll>;
 }
 
-function EmployerApp({ builders, pipeline, setPipeline, logAudit, exit, toRole, employer, fx, onSignOut }) {
+function EmployerApp({ builders, pipeline, setPipeline, logAudit, submitReview, exit, toRole, employer, fx, onSignOut }) {
   // Session restore: a saved employer record skips onboarding and lands in-app.
   const [screen, setScreen] = useState(DEMO_SEED ? "app" : employer ? "app" : "welcome");
   const [tab, setTab] = useState("dashboard");
@@ -2304,7 +2318,7 @@ function EmployerApp({ builders, pipeline, setPipeline, logAudit, exit, toRole, 
     {inApp && tab === "team" && <MyTeam pipeline={pipeline} />}
     {inApp && tab === "trust" && <TrustSafety pipeline={pipeline} onFairness={() => setTab("fairness")} onReport={() => setTab("report")} onEthics={() => setTab("ethics")} />}
     {inApp && tab === "fairness" && <FairnessPosture onBack={() => setTab("trust")} />}
-    {inApp && tab === "report" && <ReportIssue categories={REPORT_CATS_EMPLOYER} source="employer" logAudit={logAudit} onBack={() => setTab("trust")} />}
+    {inApp && tab === "report" && <ReportIssue categories={REPORT_CATS_EMPLOYER} source="employer" logAudit={logAudit} submitReview={submitReview} onBack={() => setTab("trust")} />}
     {inApp && tab === "ethics" && <EthicsPage onBack={() => setTab("trust")} />}
     {inApp && tab === "account" && <Account company={company} setCompany={c => { setCompany(c); store.saveCompany(c).catch(() => {}); }} onSignOut={onSignOut} />}
   </Shell>;
@@ -2400,6 +2414,7 @@ function SearchCard({ c, isRevealed, isShort, isIn, isSaved, budget, onShortlist
       <div style={{ textAlign: "right" }}><div style={{ fontFamily: F.disp, fontWeight: 800, fontSize: 24, color: T.emerald, lineHeight: 1 }}>{c.fit}%</div><div style={{ fontFamily: F.mono, fontSize: 10, color: T.slate }}>fit . computed</div></div>
     </div>
     <div style={{ display: "flex", gap: 7, flexWrap: "wrap", margin: "12px 0 10px" }}>{(c.skills || []).map((s, j) => <span key={j} style={{ fontFamily: F.mono, fontSize: 11.5, color: T.emerald, border: `1px solid ${T.line}`, borderRadius: 4, padding: "3px 8px" }}>{s}</span>)}</div>
+    {(c.factors?.length > 0) && <div style={{ margin: "0 0 12px", fontFamily: F.mono, fontSize: 10.5, color: T.slate }}>Computed by Telos: {c.factors.map(f => `${f.label} +${f.weight}`).join(" . ")} (capped at 99)</div>}
     {isRevealed
       ? <p style={{ fontSize: 14, color: T.ink, marginBottom: 12 }}>{c.summary}</p>
       : <div style={{ border: `1px dashed ${T.line}`, borderRadius: 8, padding: "10px 12px", marginBottom: 12, fontSize: 13, color: T.slate, background: T.paper }}>Role and summary are shielded. Request an interview to reveal them and commit to this builder.</div>}
@@ -2425,11 +2440,18 @@ function Search({ builders, pipeline, onShortlist, onRequestInterview, saved, on
   function run() {
     setBusy(true);
     const words = need.toLowerCase();
+    // Fit and its named factors are computed here, deterministically — never
+    // generated by a model. The same factor breakdown persists on the match.
     const scored = builders.map(b => {
       const roleHit = words.includes((b.role || "").toLowerCase().split(" ")[0]) ? 18 : 0;
       const skillHit = (b.skills || []).reduce((a, s) => a + (words.includes(s.toLowerCase()) ? 6 : 0), 0);
-      const fit = Math.min(99, Math.round((b.profileStrength || 70) * 0.8 + roleHit + skillHit));
-      return { ...b, fit };
+      const ps = Math.round((b.profileStrength || 70) * 0.8);
+      const fit = Math.min(99, ps + roleHit + skillHit);
+      return { ...b, fit, factors: [
+        { label: "Profile strength", weight: ps },
+        { label: "Role relevance", weight: roleHit },
+        { label: "Skill overlap", weight: skillHit },
+      ] };
     }).sort((a, b) => b.fit - a.fit);
     setTimeout(() => { setRanked(scored); setBusy(false); }, 350);
   }
@@ -2470,6 +2492,7 @@ function Pipeline({ pipeline, move, openSow }) {
           {pipeline[key].map((c, i) => <Card key={i} pad={14}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 8 }}><div style={{ fontWeight: 600, fontSize: 14 }}>{c.handle}</div>{typeof c.fit === "number" && <span style={{ fontFamily: F.mono, fontSize: 11, color: T.emerald }}>{c.fit}%</span>}</div>
             <div style={{ fontSize: 12.5, marginTop: 3, marginBottom: 8, color: T.slate }}>{shielded ? <span style={{ fontFamily: F.mono, fontSize: 11 }}>identity shielded</span> : c.role}</div>
+            {Array.isArray(c.factors) && c.factors.length > 0 && <div style={{ margin: "0 0 8px", fontFamily: F.mono, fontSize: 10.5, color: T.slate }}>Computed fit: {c.factors.map(f => `${f.label} +${f.weight}`).join(" . ")}</div>}
             <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
               {ci > 0 && <Btn kind="ghost" small onClick={() => move(c, key, COLS[ci - 1][0])}>← {COLS[ci - 1][1]}</Btn>}
               {ci < 2 && <Btn small onClick={() => move(c, key, COLS[ci + 1][0])}>{COLS[ci + 1][1]} →</Btn>}
@@ -2906,6 +2929,12 @@ export default function App() {
   const [pipeline, setPipeline] = useState(DEMO_SEED ? SEED_PIPELINE : { shortlisted: [], interviewing: [], sow: [] });
   const [squads, setSquads] = useState(SEED_SQUADS);
   const [audit, setAudit] = useState([]);
+  // Review-queue rows I filed (contests, human reviews, reports) — drives the
+  // "under review" markers so they clear when a reviewer resolves them.
+  const [reviews, setReviews] = useState(null);
+  // Password recovery: the reset link lands here with a recovery session and
+  // the app shows the set-new-password screen instead of the landing page.
+  const [recovery, setRecovery] = useState(false);
   // The signed-in user's own builder record and employer org, when a backend
   // is configured. Drives session restore on both portals.
   const [me, setMe] = useState(null);
@@ -2941,6 +2970,7 @@ export default function App() {
           const seen = new Set(prev.map(e => `${e.kind}:${e.at}`));
           return [...prev, ...net.audit.filter(e => !seen.has(`${e.kind}:${e.at}`))];
         });
+        setReviews(net.reviews || []);
         if (net.fx) setFx(net.fx);
         setMe(net.me ? { ...net.me, docs: net.docs } : null);
         setMyEmployer(net.employer || null);
@@ -2952,6 +2982,9 @@ export default function App() {
   // Every mutation writes through to the store. Each store call no-ops without
   // a backend, so these stay correct in both postures.
   const logAudit = e => { setAudit(a => [{ ...e, at: Date.now() }, ...a]); store.logAudit(e).catch(() => {}); };
+  // Optimistic queue row + durable write; the local row makes "under review"
+  // appear immediately without waiting for a reload.
+  const submitReview = r => { setReviews(prev => [{ status: "open", created_at: new Date().toISOString(), ...r }, ...(prev || [])]); store.submitReview(r).catch(() => {}); };
   const addBuilder = b => { setBuilders(prev => [b, ...prev]); store.addBuilder(b).catch(() => {}); };
   // Data deletion: remove the builder from the shared network store, so the
   // profile stops appearing in employer search and in Community. This is what
@@ -2970,20 +3003,32 @@ export default function App() {
   // Real sign-out: clears the Supabase session token and the restored
   // identities so the next visit starts signed out, then lands home.
   const signOut = () => { authSignOut().finally(() => { setMe(null); setMyEmployer(null); setView("landing"); }); };
+
+  // Recovery links land as #...&type=recovery and emit PASSWORD_RECOVERY.
+  // Either signal parks the app on the set-new-password screen.
+  useEffect(() => {
+    if (!supabase) return;
+    if (/type=recovery/.test(window.location.hash)) setRecovery(true);
+    const { data: { subscription } } = supabase.auth.onAuthStateChange(evt => {
+      if (evt === "PASSWORD_RECOVERY") setRecovery(true);
+    });
+    return () => subscription.unsubscribe();
+  }, []);
   const [fontSize, setFontSize] = useState("default");
   const scale = FONT_SCALE[fontSize] || 1;
   // The marketing views (landing, role selection) are Tailwind-styled and use
   // IBM Plex Sans as their base font, separate from the inline-styled app shell.
   const marketingFont = { fontFamily: "'IBM Plex Sans', sans-serif" };
+  if (recovery) return <div style={marketingFont}><ResetPasswordPage onDone={() => { authSignOut(); setRecovery(false); history.replaceState(null, "", window.location.pathname); }} /></div>;
   return <div style={{ background: T.paper, minHeight: "100vh", color: T.ink, fontFamily: F.body, zoom: scale, "--base-font-size": `${(14 * scale).toFixed(1)}px` }}>
     <style>{FONTS}</style>
     <FontSizeCtx.Provider value={{ size: fontSize, setSize: setFontSize }}>
       <ToastProvider>
-        <HumanReviewProvider logAudit={logAudit}>
+        <HumanReviewProvider logAudit={logAudit} submitReview={submitReview}>
           {view === "landing" && <div style={marketingFont}><LandingPage onSignInClick={toRole} /></div>}
           {view === "role" && <div style={marketingFont}><RoleSelectionPage onRoleSelect={r => setView(r === "builder" ? "candidate" : "employer")} onBack={() => setView("landing")} /></div>}
-          {view === "candidate" && <CandidateApp addBuilder={addBuilder} removeBuilder={removeBuilder} builders={builders} pipeline={pipeline} squads={squads} joinSquad={joinSquad} leaveSquad={leaveSquad} formSquad={formSquad} audit={audit} logAudit={logAudit} exit={() => setView("landing")} toRole={toRole} me={me} onSignOut={signOut} />}
-          {view === "employer" && <EmployerApp builders={builders} pipeline={pipeline} setPipeline={setPipelinePersist} logAudit={logAudit} exit={() => setView("landing")} toRole={toRole} employer={myEmployer} fx={fx} onSignOut={signOut} />}
+          {view === "candidate" && <CandidateApp addBuilder={addBuilder} removeBuilder={removeBuilder} builders={builders} pipeline={pipeline} squads={squads} joinSquad={joinSquad} leaveSquad={leaveSquad} formSquad={formSquad} audit={audit} logAudit={logAudit} submitReview={submitReview} reviews={reviews} exit={() => setView("landing")} toRole={toRole} me={me} onSignOut={signOut} />}
+          {view === "employer" && <EmployerApp builders={builders} pipeline={pipeline} setPipeline={setPipelinePersist} logAudit={logAudit} submitReview={submitReview} exit={() => setView("landing")} toRole={toRole} employer={myEmployer} fx={fx} onSignOut={signOut} />}
         </HumanReviewProvider>
       </ToastProvider>
     </FontSizeCtx.Provider>

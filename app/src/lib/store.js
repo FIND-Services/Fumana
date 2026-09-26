@@ -72,7 +72,7 @@ export async function loadNetwork() {
   for (const m of matches || []) {
     const b = byBuilder[m.builder_id];
     if (!b || !pipeline[m.status]) continue;
-    pipeline[m.status].push({ ...b, fit: m.fit, monthlyUsd: m.monthly_usd });
+    pipeline[m.status].push({ ...b, fit: m.fit, monthlyUsd: m.monthly_usd, factors: m.factors || [] });
   }
 
   // Squads with my membership flag.
@@ -83,11 +83,16 @@ export async function loadNetwork() {
   const mine2 = new Set((memberships || []).map(x => x.squad_id));
   const squadList = (squads || []).map(s => ({ ...s, joined: mine2.has(s.id) }));
 
-  // My audit trail, newest first, in the app's { kind, ...payload, at } shape.
+  // My audit trail, newest first. RLS returns own events plus subject events
+  // (things others did about my builder: reveals, pipeline moves, SOWs).
   const { data: audit } = await supabase.from("audit_events").select("*").order("created_at", { ascending: false });
-  const auditList = (audit || []).map(e => ({ kind: e.kind, ...(e.payload || {}), at: Date.parse(e.created_at) }));
+  const auditList = (audit || []).map(e => ({ kind: e.kind, ...(e.payload || {}), aboutMe: Boolean(e.subject_builder_id && mine && e.subject_builder_id === mine.id), at: Date.parse(e.created_at) }));
 
-  return { builders, pipeline, squads: squadList, audit: auditList, me: mine, docs: docs || null, employer, fx };
+  // My open review-queue items (contests, human reviews, reports I filed).
+  const user = await currentUser();
+  const { data: reviewRows } = user ? await supabase.from("reviews").select("*").order("created_at", { ascending: false }) : { data: [] };
+
+  return { builders, pipeline, squads: squadList, audit: auditList, reviews: reviewRows || [], me: mine, docs: docs || null, employer, fx };
 }
 
 // ---- writes (each resolves quietly when there is no backend or no session) ----
@@ -169,8 +174,9 @@ export async function saveCompany(company) {
 }
 
 // Rewrites the current employer's pipeline to match the given stage map.
-// Resolves handles to builder ids, upserts matches, and removes matches whose
-// builder is no longer in any stage. SOW-stage entries also get an engagement.
+// Resolves handles to builder ids, upserts matches with their computed
+// factors, links them to the employer's Role row, and writes subject-scoped
+// audit events so the builder sees what happened to their profile.
 export async function savePipeline(pipeline) {
   if (!supabase) return;
   const employer = await myEmployer();
@@ -186,14 +192,29 @@ export async function savePipeline(pipeline) {
     : { data: [] };
   const idOf = Object.fromEntries((brows || []).map(b => [b.masked_handle, b.id]));
 
+  // The employer's hiring need is a canonical Role row; created once and
+  // reused by every match this employer makes.
+  let { data: role } = await supabase.from("roles").select("id").eq("employer_id", employer.id).limit(1).maybeSingle();
+  if (!role) {
+    ({ data: role } = await supabase.from("roles")
+      .insert({ employer_id: employer.id, title: (employer.hiring_for || "").slice(0, 120) || "Open role", need: employer.hiring_for || null })
+      .select("id").single());
+  }
+
+  // Prior stages, so transitions produce subject events the builder sees.
+  const { data: prior } = await supabase.from("matches").select("builder_id, status").eq("employer_id", employer.id);
+  const priorStatus = Object.fromEntries((prior || []).map(m => [m.builder_id, m.status]));
+  const REVEALED = ["interviewing", "sow"];
+  const subjectEvents = [];
+
   const keep = [];
   for (const { status, c } of entries) {
     const bid = idOf[c.handle];
     if (!bid) continue;
     keep.push(bid);
     const { data: match } = await supabase.from("matches").upsert({
-      builder_id: bid, employer_id: employer.id, status,
-      fit: c.fit ?? null, monthly_usd: c.monthlyUsd ?? null,
+      builder_id: bid, employer_id: employer.id, role_id: role?.id || null, status,
+      fit: c.fit ?? null, monthly_usd: c.monthlyUsd ?? null, factors: c.factors || [],
     }, { onConflict: "builder_id,employer_id" }).select("id").single();
     if (status === "sow" && match?.id) {
       await supabase.from("engagements").upsert(
@@ -201,11 +222,25 @@ export async function savePipeline(pipeline) {
         { onConflict: "match_id" }
       );
     }
+    const was = priorStatus[bid];
+    if (!was) subjectEvents.push([bid, { kind: "shortlisted" }]);
+    else if (!REVEALED.includes(was) && REVEALED.includes(status)) subjectEvents.push([bid, { kind: "reveal", status }]);
+    else if (was !== status) subjectEvents.push([bid, { kind: "pipeline-move", status }]);
   }
   // Drop matches for this employer that are no longer in the pipeline.
+  for (const m of prior || []) if (!keep.includes(m.builder_id)) subjectEvents.push([m.builder_id, { kind: "pipeline-withdrawn" }]);
   let q = supabase.from("matches").delete().eq("employer_id", employer.id);
   if (keep.length) q = q.not("builder_id", "in", `(${keep.join(",")})`);
   await q;
+
+  // The actor owns the row; subject_builder_id exposes it to the builder.
+  const user = await currentUser();
+  if (subjectEvents.length && user) {
+    await supabase.from("audit_events").insert(subjectEvents.map(([bid, evt]) => {
+      const { kind, ...payload } = evt;
+      return { owner_id: user.id, subject_builder_id: bid, kind, payload };
+    }));
+  }
 }
 
 export async function joinSquad(squadId) {
@@ -247,6 +282,7 @@ export async function saveSow(handle, sow) {
     .upsert({ match_id: m.id, sow }, { onConflict: "match_id" })
     .select("id").single();
   if (!eng?.id) return;
+  await logSubjectAudit(b.id, { kind: "sow-generated" });
   const { data: fx } = await supabase.from("fx_rates").select("rate").eq("base_pair", "USD/NGN").maybeSingle();
   const rate = fx?.rate ?? null;
   const monthly = m.monthly_usd || sow?.monthlyUsd || 0;
@@ -270,6 +306,31 @@ export async function logAudit(evt) {
   if (!user) return;
   const { kind, ...payload } = evt;
   await supabase.from("audit_events").insert({ owner_id: user.id, kind, payload });
+}
+
+// An event caused by me about someone else's builder — reveals, pipeline
+// moves, SOW drafts. owner_id is the actor; subject_builder_id makes the event
+// visible in the builder's own audit trail via the subject read policy.
+export async function logSubjectAudit(builderId, evt) {
+  if (!supabase || !builderId) return;
+  const user = await currentUser();
+  if (!user) return;
+  const { kind, ...payload } = evt;
+  await supabase.from("audit_events").insert({ owner_id: user.id, subject_builder_id: builderId, kind, payload });
+}
+
+// File a real review-queue row: a contest, a human-review request, or a
+// report. Returns the human reference for the received state.
+export async function submitReview({ kind, subject, reason, context, ref }) {
+  if (!supabase) return;
+  const user = await currentUser();
+  if (!user) return;
+  const me = await myBuilder();
+  await supabase.from("reviews").insert({
+    owner_id: user.id, kind, ref, subject: subject || null,
+    reason: reason || null, context: context || null,
+    builder_id: me?.id || null,
+  });
 }
 
 export async function setPremium(isPremium) {
