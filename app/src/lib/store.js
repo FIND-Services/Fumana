@@ -84,7 +84,7 @@ export async function loadNetwork() {
   for (const m of matches || []) {
     const b = byBuilder[m.builder_id];
     if (!b || !pipeline[m.status]) continue;
-    pipeline[m.status].push({ ...b, matchId: m.id, fit: m.fit, monthlyUsd: m.monthly_usd, factors: m.factors || [], engagement: engByMatch[m.id] || null });
+    pipeline[m.status].push({ ...b, matchId: m.id, matchedAt: m.created_at, fit: m.fit, monthlyUsd: m.monthly_usd, factors: m.factors || [], engagement: engByMatch[m.id] || null });
   }
 
   // Squads with my membership flag.
@@ -305,12 +305,27 @@ export async function verifyDomain(phase) {
   return res.ok ? res.json() : null;
 }
 
+// Transactional notification: the notify edge function derives the recipient
+// and template from the match + fixed event name — callers only say what
+// happened, never who to mail or what to say. Fire-and-forget; inert until
+// BREVO_API_KEY is set as a function secret.
+export function notifyEvent(matchId, event) {
+  if (!supabase || !matchId) return;
+  apiHeaders()
+    .then(headers => fetch(LLM_URL.replace("llm-proxy", "notify"), {
+      method: "POST", headers, body: JSON.stringify({ match_id: matchId, event }),
+    }))
+    .catch(() => {});
+}
+
 // Builder side of the engagement lifecycle: accept or decline a drafted SOW.
 // Goes through the constrained RPC because engagements UPDATE is employer-only.
 // Returns the settled status ('active' | 'closed') or null.
 export async function respondToEngagement(matchId, action) {
   if (!supabase || !matchId) return null;
   const { data, error } = await supabase.rpc("respond_to_engagement", { p_match: matchId, p_action: action });
+  if (!error && data === "active") notifyEvent(matchId, "sow-accepted");
+  if (!error && data === "closed") notifyEvent(matchId, "sow-declined");
   return error ? null : data;
 }
 
@@ -320,6 +335,7 @@ export async function setEngagementStatus(matchId, status, builderId) {
   if (!supabase || !matchId) return;
   await supabase.from("engagements").update({ status }).eq("match_id", matchId);
   if (builderId) await logSubjectAudit(builderId, { kind: "engagement-closed", status });
+  if (status === "closed") notifyEvent(matchId, "engagement-closed");
 }
 
 // Upserts the employer's company record, keyed on the signed-in owner.
@@ -385,8 +401,10 @@ export async function savePipeline(pipeline) {
     }
     const was = priorStatus[bid];
     if (!was) subjectEvents.push([bid, { kind: "shortlisted" }]);
-    else if (!REVEALED.includes(was) && REVEALED.includes(status)) subjectEvents.push([bid, { kind: "reveal", status }]);
-    else if (was !== status) subjectEvents.push([bid, { kind: "pipeline-move", status }]);
+    else if (!REVEALED.includes(was) && REVEALED.includes(status)) {
+      subjectEvents.push([bid, { kind: "reveal", status }]);
+      if (match?.id) notifyEvent(match.id, "interview-requested");
+    } else if (was !== status) subjectEvents.push([bid, { kind: "pipeline-move", status }]);
   }
   // Drop matches for this employer that are no longer in the pipeline.
   for (const m of prior || []) if (!keep.includes(m.builder_id)) subjectEvents.push([m.builder_id, { kind: "pipeline-withdrawn" }]);
@@ -444,6 +462,7 @@ export async function saveSow(handle, sow, jurisdictionId) {
     .select("id").single();
   if (!eng?.id) return;
   await logSubjectAudit(b.id, { kind: "sow-generated" });
+  notifyEvent(m.id, "sow-sent");
   const { data: fx } = await supabase.from("fx_rates").select("rate").eq("base_pair", "USD/NGN").maybeSingle();
   const rate = fx?.rate ?? null;
   const monthly = m.monthly_usd || sow?.monthlyUsd || 0;

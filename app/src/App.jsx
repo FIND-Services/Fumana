@@ -431,6 +431,14 @@ const APP_STAGE = {
 };
 const APP_STAGES = ["shortlisted", "interviewing", "sow"];
 
+// Anti-ghosting: days since the match or engagement last changed. Both sides
+// see the same computed number — the employer sees a stale awaiting-acceptance
+// offer, the builder sees a quiet interviewer. Computed, not generated.
+const quietDays = e => {
+  const t = e.engagement?.created_at || e.matchedAt;
+  return t ? Math.max(0, Math.floor((Date.now() - new Date(t).getTime()) / 86400000)) : null;
+};
+
 function Applications({ builders, pipeline, onEngagementUpdate }) {
   const toast = useToast();
   const [responding, setResponding] = useState(null); // matchId being answered
@@ -491,6 +499,7 @@ function Applications({ builders, pipeline, onEngagementUpdate }) {
                   <div style={{ fontWeight: 600, fontSize: 15 }}>{e.entry.role}</div>
                   <div style={{ fontSize: 13.5, color: T.slate, marginTop: 4 }}>{s.note}</div>
                   {e.entry.monthlyUsd ? <div style={{ fontFamily: F.mono, fontSize: 12, color: T.slate, marginTop: 6 }}>{usd(e.entry.monthlyUsd)} / month</div> : null}
+                  {(quietDays(e.entry) ?? 0) >= 7 && <div style={{ fontFamily: F.mono, fontSize: 11, color: T.brass, marginTop: 6 }}>quiet {quietDays(e.entry)}d — you can report or move on anytime</div>}
                 </div>
                 <span style={{ fontFamily: F.mono, fontSize: 11, color: T.onAccent, background: s.color, borderRadius: 5, padding: "4px 10px", whiteSpace: "nowrap" }}>{s.label}</span>
               </div>
@@ -756,7 +765,7 @@ function AuditTrail({ audit, onBack }) {
 // ---- Report an issue (both portals). NO MODEL ----
 // A real report flow: category + description + optional evidence, then a
 // received state with a reference and timeframe. Logged to the shared audit
-// store; reviewed by a human, not an AI. Queue is stubbed and flagged.
+// store and filed as a real reviews-queue row; reviewed by a human, not an AI.
 const REPORT_CATS_CANDIDATE = ["Unfair assessment", "Employer breached the fair-terms pledge", "Harassment or conduct", "Other"];
 const REPORT_CATS_EMPLOYER = ["Builder conduct", "Platform issue", "Billing dispute", "Other"];
 
@@ -831,7 +840,7 @@ function EthicsPage({ onBack }) {
         <Li>What: your name and contact details, the experience you write, your interview answers, and the scores produced from them.</Li>
         <Li>Why: to build a profile employers can trust and to match you to work. We do not sell your data.</Li>
         <Li>How long: while your profile is active. When you delete it, we remove it.</Li>
-        <Li>We keep the minimum needed to run the service. In this prototype storage is stubbed; real retention runs on the backend.</Li>
+        <Li>We keep the minimum needed to run the service. Your records live in your account until you delete them.</Li>
       </ul>
     </Section>
 
@@ -1002,7 +1011,7 @@ function Settings({ builders, onDelete, onDeleteAccount, onFairness, onAudit, on
 
     <Card><Label>Language</Label>
       <select value={lang} onChange={e => setLang(e.target.value)} style={{ ...ctrl, width: "100%" }}>{LANGUAGES.map(l => <option key={l} value={l}>{l}</option>)}</select>
-      <div style={{ marginTop: 8, fontFamily: F.mono, fontSize: 11, color: T.slate }}>Applied across the app on the backend.</div>
+      <div style={{ marginTop: 8, fontFamily: F.mono, fontSize: 11, color: T.slate }}>Applied on this device.</div>
     </Card>
     <div style={{ height: 14 }} />
 
@@ -1017,7 +1026,7 @@ function Settings({ builders, onDelete, onDeleteAccount, onFairness, onAudit, on
         <span style={{ fontSize: 14 }}>{ch.name}</span>
         <Toggle on={channels[ch.id]} label={ch.name} onClick={() => setChannels(c => ({ ...c, [ch.id]: !c[ch.id] }))} />
       </div>)}</div>
-      <div style={{ marginTop: 10, fontFamily: F.mono, fontSize: 11, color: T.slate }}>Delivery runs on the backend.</div>
+      <div style={{ marginTop: 10, fontFamily: F.mono, fontSize: 11, color: T.slate }}>Email delivery runs through Brevo once the mail key is configured; WhatsApp and SMS are roadmap.</div>
     </Card>
     <div style={{ height: 14 }} />
 
@@ -1615,9 +1624,9 @@ function Consent({ onNext, onBack }) {
 
 // ---- Async elevator pitch recorder (candidate). NO MODEL ----
 // Browser MediaRecorder capture of camera + mic, a 60s countdown that auto-stops,
-// retake, and a playback preview. Recording is in-browser; upload and storage
-// are a backend step. (The interview uses pre-rendered clips, so there is no
-// live capture to reuse; this is built directly on MediaRecorder.)
+// retake, and a playback preview. The recording uploads to the private
+// builder-media bucket at assessment completion — employers can play it only
+// after the reveal boundary.
 function PitchRecorder({ onBlob }) {
   const [phase, setPhase] = useState("idle"); // idle | recording | recorded | error
   const [remaining, setRemaining] = useState(60);
@@ -2397,7 +2406,7 @@ function EmpAlignment({ onEnter, onBack }) {
 function EmpDashboard({ company, onEngage }) {
   return <Scroll><div style={{ maxWidth: 860, margin: "0 auto" }} className="rise">
     <Eyebrow>Dashboard</Eyebrow>
-    <h2 style={{ fontFamily: F.disp, fontWeight: 700, fontSize: 26, margin: "6px 0 4px" }}>{company.name || "Your company"}</h2>
+    <h2 style={{ fontFamily: F.disp, fontWeight: 700, fontSize: 26, margin: "6px 0 4px" }}>{company.name || "Your company"}{company.verified && <span style={{ display: "inline-block", marginLeft: 10, fontFamily: F.mono, fontSize: 11, color: T.emerald, border: `1px solid ${T.emerald}`, borderRadius: 4, padding: "3px 8px", verticalAlign: "middle" }}>verified domain</span>}</h2>
     <p style={{ color: T.slate, fontSize: 15, marginBottom: 18 }}>Welcome to Fumana. Your organization is set up. Engage verified, bias-shielded talent whenever you are ready.</p>
     <Card><Label>Get started</Label><div style={{ fontFamily: F.disp, fontWeight: 700, fontSize: 18, margin: "8px 0 6px" }}>Engage experts</div><p style={{ fontSize: 13.5, color: T.slate, marginBottom: 14 }}>Describe the work and search the network by evidence.</p><Btn onClick={onEngage}>Engage Experts</Btn></Card>
   </div></Scroll>;
@@ -2408,8 +2417,8 @@ function EmployerApp({ builders, pipeline, setPipeline, logAudit, submitReview, 
   const [screen, setScreen] = useState(DEMO_SEED ? "app" : employer ? "app" : "welcome");
   const [tab, setTab] = useState("dashboard");
   const [company, setCompany] = useState(DEMO_SEED ? SEED_COMPANIES[0]
-    : employer ? { name: employer.name || "", domain: employer.domain || "", industry: employer.industry || "", size: employer.size || "", country: employer.country || "", hiringFor: employer.hiring_for || "" }
-    : { name: "", domain: "", industry: "", size: "", country: "", hiringFor: "" });
+    : employer ? { name: employer.name || "", domain: employer.domain || "", industry: employer.industry || "", size: employer.size || "", country: employer.country || "", hiringFor: employer.hiring_for || "", verified: employer.domain_verified || false }
+    : { name: "", domain: "", industry: "", size: "", country: "", hiringFor: "", verified: false });
   const [active, setActive] = useState(null); const [sow, setSow] = useState(null);
   const toast = useToast();
   const inApp = screen === "app";
@@ -2508,7 +2517,9 @@ function MyTeam({ pipeline, onEngagementUpdate }) {
             <div><div style={{ fontWeight: 600, fontSize: 14 }}>{c.handle}</div><div style={{ color: T.slate, fontSize: 12.5 }}>{c.role}</div>
               <div style={{ fontFamily: F.mono, fontSize: 10.5, marginTop: 4, color: c.engagement?.status === "active" ? T.emerald : c.engagement?.status === "closed" ? T.alert : T.brass }}>
                 {!c.engagement ? "sow stage" : c.engagement.status === "active" ? "active" : c.engagement.status === "closed" ? "closed" : "awaiting builder acceptance"}
-              </div></div>
+              </div>
+              {(quietDays(c) ?? 0) >= 7 && c.engagement?.status !== "closed" && <div style={{ fontFamily: F.mono, fontSize: 10.5, color: T.brass, marginTop: 3 }}>quiet {quietDays(c)}d</div>}
+            </div>
             <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
               <div style={{ fontFamily: F.mono, fontSize: 15 }}>{usd(c.monthlyUsd || 0)}<span style={{ color: T.slate, fontSize: 11 }}> / mo</span></div>
               {c.engagement?.status === "active" && <Btn small kind="ghost" onClick={() => closeEngagement(c)}>End engagement</Btn>}
@@ -2531,7 +2542,7 @@ function Account({ company, setCompany, onSignOut }) {
   return <Scroll><div style={{ maxWidth: 640, margin: "0 auto" }} className="rise">
     <Eyebrow>Account</Eyebrow>
     <h2 style={{ fontFamily: F.disp, fontWeight: 700, fontSize: 26, margin: "6px 0 4px" }}>Company account</h2>
-    <p style={{ color: T.slate, fontSize: 15, marginBottom: 18 }}>Your organization profile. Editable here; persistence and verification are backend steps.</p>
+    <p style={{ color: T.slate, fontSize: 15, marginBottom: 18 }}>Your organization profile, saved to your account. Verify your domain below.</p>
     <Card>
       <Field label="Company name" value={draft.name} onChange={v => set("name", v)} placeholder="Acme GmbH" />
       <Field label="Work email domain" value={draft.domain} onChange={v => set("domain", v)} placeholder="acme.com" />
@@ -2543,9 +2554,9 @@ function Account({ company, setCompany, onSignOut }) {
     </Card>
     <div style={{ marginTop: 16, display: "flex", gap: 12, alignItems: "center" }}><Btn disabled={!dirty} onClick={() => { setCompany(draft); toast("Account saved."); }}>Save changes</Btn>
       {onSignOut && <Btn kind="ghost" small onClick={onSignOut}>Sign out</Btn>}</div>
-    <div style={{ marginTop: 10, fontFamily: F.mono, fontSize: 11, color: T.slate }}>Company profile, billing, and verification run on the backend.</div>
+    <div style={{ marginTop: 10, fontFamily: F.mono, fontSize: 11, color: T.slate }}>Billing runs on the backend.</div>
     <div style={{ height: 14 }} />
-    <DomainVerify company={company} />
+    <DomainVerify company={company} onVerified={() => setCompany(c => ({ ...c, verified: true }))} />
     <div style={{ height: 14 }} />
     <Card><Label>Text size</Label>
       <p style={{ fontSize: 13.5, color: T.slate, margin: "8px 0 10px" }}>Scale the whole app for easier reading.</p>
@@ -2558,9 +2569,9 @@ function Account({ company, setCompany, onSignOut }) {
 // Domain verification: the employer publishes a DNS TXT record
 // (fumana-verify=<token>) on their company domain; the verify-domain edge
 // function does the lookup over DNS-over-HTTPS and flips domain_verified.
-function DomainVerify({ company }) {
+function DomainVerify({ company, onVerified }) {
   const toast = useToast();
-  const [state, setState] = useState(null); // {domain, token, verified}
+  const [state, setState] = useState(company.verified ? { domain: company.domain, verified: true } : null); // {domain, token, verified}
   const [busy, setBusy] = useState(false);
   async function issue() {
     if (!hasBackend) { toast("Domain verification needs a configured backend."); return; }
@@ -2574,7 +2585,7 @@ function DomainVerify({ company }) {
     setBusy(true);
     const r = await store.verifyDomain("check");
     setBusy(false);
-    if (r?.verified) { setState(s => ({ ...s, verified: true })); toast("Domain verified."); }
+    if (r?.verified) { setState(s => ({ ...s, verified: true })); if (onVerified) onVerified(); toast("Domain verified."); }
     else toast("Record not found yet — DNS changes can take a few minutes to propagate.");
   }
   return <Card><Label>Domain verification</Label>
