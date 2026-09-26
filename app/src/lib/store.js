@@ -7,7 +7,7 @@
 // The app keys network entries by masked handle, so lookups resolve handle ->
 // builder id at write time rather than threading uuids through the UI.
 
-import { supabase, currentUser } from "./backend";
+import { supabase, currentUser, apiHeaders, LLM_URL } from "./backend";
 
 const rowToBuilder = (r, myId) => ({
   id: r.id,
@@ -68,11 +68,23 @@ export async function loadNetwork() {
   // Matches I can see: my org's pipeline plus engagements involving my builder.
   const { data: matches } = await supabase.from("matches").select("*");
   const byBuilder = Object.fromEntries(builders.map(b => [b.id, b]));
+
+  // Engagements on those matches, with their jurisdiction attached. The
+  // pipeline card carries both so lifecycle state (draft/active/closed)
+  // renders without a second lookup.
+  const matchIds = (matches || []).map(m => m.id);
+  const [{ data: engRows }, { data: juris }] = await Promise.all([
+    matchIds.length ? supabase.from("engagements").select("*").in("match_id", matchIds) : { data: [] },
+    supabase.from("jurisdictions").select("*"),
+  ]);
+  const jById = Object.fromEntries((juris || []).map(j => [j.id, j]));
+  const engByMatch = Object.fromEntries((engRows || []).map(g => [g.match_id, { ...g, jurisdiction: jById[g.jurisdiction_id] || null }]));
+
   const pipeline = { shortlisted: [], interviewing: [], sow: [] };
   for (const m of matches || []) {
     const b = byBuilder[m.builder_id];
     if (!b || !pipeline[m.status]) continue;
-    pipeline[m.status].push({ ...b, fit: m.fit, monthlyUsd: m.monthly_usd, factors: m.factors || [] });
+    pipeline[m.status].push({ ...b, matchId: m.id, fit: m.fit, monthlyUsd: m.monthly_usd, factors: m.factors || [], engagement: engByMatch[m.id] || null });
   }
 
   // Squads with my membership flag.
@@ -92,7 +104,16 @@ export async function loadNetwork() {
   const user = await currentUser();
   const { data: reviewRows } = user ? await supabase.from("reviews").select("*").order("created_at", { ascending: false }) : { data: [] };
 
-  return { builders, pipeline, squads: squadList, audit: auditList, reviews: reviewRows || [], me: mine, docs: docs || null, employer, fx };
+  // My employer's saved-builder bookmarks (ids; cards resolve via the pool).
+  const { data: savedRows } = employer
+    ? await supabase.from("saved_builders").select("builder_id").eq("employer_id", employer.id)
+    : { data: [] };
+
+  // Admins (app_metadata.role='admin', server-set) see the whole queue via the
+  // admin read policy — the same query returns just own rows for others.
+  const isAdmin = user?.app_metadata?.role === "admin";
+
+  return { builders, pipeline, squads: squadList, audit: auditList, reviews: reviewRows || [], savedIds: (savedRows || []).map(r => r.builder_id), jurisdictions: juris || [], isAdmin, me: mine, docs: docs || null, employer, fx };
 }
 
 // ---- writes (each resolves quietly when there is no backend or no session) ----
@@ -121,7 +142,7 @@ export async function addBuilder(b) {
   // Before the persistence migration lands there is no unique constraint on
   // owner_id; fall back to a plain insert so saves keep working meanwhile.
   if (error) ({ data: row } = await supabase.from("builders").insert(fields).select("id").single());
-  if (!row) return;
+  if (!row) return null;
   await supabase.from("builder_documents").upsert({
     builder_id: row.id,
     experience: b.experience || null,
@@ -130,6 +151,7 @@ export async function addBuilder(b) {
     accommodations: b.accommodations || null,
     updated_at: new Date().toISOString(),
   }, { onConflict: "builder_id" });
+  return row.id;
 }
 
 // Partial update of the owner-only documents (CV saves, transcript, etc).
@@ -159,6 +181,145 @@ export async function saveAlchemist(result) {
 export async function removeBuilder(handle) {
   if (!supabase) return;
   await supabase.from("builders").delete().eq("masked_handle", handle);
+}
+
+// Employer's bookmarked builders. Stores ids only — the masked view stays the
+// sole read path until reveal, so saving never unshields anyone.
+export async function toggleSavedBuilder(builderId, on) {
+  if (!supabase || !builderId) return;
+  const employer = await myEmployer();
+  if (!employer) return;
+  if (on) await supabase.from("saved_builders").upsert({ employer_id: employer.id, builder_id: builderId }, { onConflict: "employer_id,builder_id" });
+  else await supabase.from("saved_builders").delete().eq("employer_id", employer.id).eq("builder_id", builderId);
+}
+
+// Pitch recordings and uploaded CVs live in the private builder-media bucket
+// under <builder_id>/<file>. RLS mirrors the reveal boundary: the owner reads
+// and writes; an employer reads only after interview commitment.
+export async function uploadMedia(builderId, file, name) {
+  if (!supabase || !builderId || !file) return;
+  await supabase.storage.from("builder-media").upload(`${builderId}/${name}`, file, { upsert: true });
+}
+
+// Short-lived signed URL for a stored object (pitch playback, CV download).
+export async function mediaUrl(builderId, name) {
+  if (!supabase || !builderId) return null;
+  const { data } = await supabase.storage.from("builder-media").createSignedUrl(`${builderId}/${name}`, 120);
+  return data?.signedUrl || null;
+}
+
+// Full account deletion: a security-definer RPC removes every row the account
+// owns on both sides (builder, employer, docs, media, reviews, audit) and the
+// auth user itself. The session dies with it.
+export async function deleteAccount() {
+  if (!supabase) return;
+  await supabase.rpc("delete_account");
+}
+
+// Admin review queue: every filed row, and the resolve path only admins can
+// take (RLS enforces — non-admins can never update reviews).
+export async function listReviews() {
+  if (!supabase) return null;
+  const { data } = await supabase.from("reviews").select("*").order("created_at", { ascending: false });
+  return data || [];
+}
+
+export async function resolveReview(id, status, resolution) {
+  if (!supabase || !id) return;
+  await supabase.from("reviews").update({
+    status,
+    resolution: resolution || null,
+    resolved_at: status === "resolved" ? new Date().toISOString() : null,
+  }).eq("id", id);
+}
+
+// Everything we hold about the signed-in user, assembled client-side from the
+// rows RLS already lets them read — no elevated path needed for a self-export.
+export async function exportMyData() {
+  if (!supabase) return null;
+  const user = await currentUser();
+  if (!user) return null;
+  const [me, employer, docs, matches, audit, reviewRows] = await Promise.all([
+    myBuilder(),
+    myEmployer(),
+    supabase.from("builder_documents").select("*"),
+    supabase.from("matches").select("*"),
+    supabase.from("audit_events").select("*").order("created_at", { ascending: false }),
+    supabase.from("reviews").select("*").order("created_at", { ascending: false }),
+  ]);
+  return {
+    exported_at: new Date().toISOString(),
+    account: { id: user.id, email: user.email, created_at: user.created_at },
+    builder: me || null,
+    documents: docs.data || null,
+    employer: employer || null,
+    matches: matches.data || [],
+    audit_events: audit.data || [],
+    reviews: reviewRows.data || [],
+  };
+}
+
+// Realtime sync: ping the callback when matches or reviews change so the app
+// re-hydrates instead of waiting for a refresh. Returns an unsubscribe fn.
+export function subscribeNetwork(onChange) {
+  if (!supabase) return () => {};
+  const ch = supabase.channel("net-sync")
+    .on("postgres_changes", { event: "*", schema: "public", table: "matches" }, onChange)
+    .on("postgres_changes", { event: "*", schema: "public", table: "reviews" }, onChange)
+    .subscribe();
+  return () => { supabase.removeChannel(ch); };
+}
+
+// TOTP two-factor. supabase.auth.mfa owns the factors; these thin wrappers
+// keep the UI on the store boundary. Each no-ops without a backend.
+export async function mfaFactors() {
+  if (!supabase) return [];
+  const { data } = await supabase.auth.mfa.listFactors();
+  return data?.totp || [];
+}
+export async function mfaEnroll() {
+  if (!supabase) return { data: null, error: { message: "No backend configured" } };
+  return supabase.auth.mfa.enroll({ factorType: "totp" });
+}
+export async function mfaVerify(factorId, code) {
+  if (!supabase) return { error: { message: "No backend configured" } };
+  const { data: ch, error: cErr } = await supabase.auth.mfa.challenge({ factorId });
+  if (cErr) return { error: cErr };
+  return supabase.auth.mfa.verify({ factorId, challengeId: ch.id, code });
+}
+export async function mfaUnenroll(factorId) {
+  if (!supabase) return { error: { message: "No backend configured" } };
+  return supabase.auth.mfa.unenroll({ factorId });
+}
+
+// Employer domain verification: the edge function holds the DNS check and the
+// domain_verified write. phase "issue" returns the TXT token to publish;
+// phase "check" performs the lookup and flips the flag.
+export async function verifyDomain(phase) {
+  if (!supabase) return null;
+  const res = await fetch(LLM_URL.replace("llm-proxy", "verify-domain"), {
+    method: "POST",
+    headers: await apiHeaders(),
+    body: JSON.stringify({ phase }),
+  });
+  return res.ok ? res.json() : null;
+}
+
+// Builder side of the engagement lifecycle: accept or decline a drafted SOW.
+// Goes through the constrained RPC because engagements UPDATE is employer-only.
+// Returns the settled status ('active' | 'closed') or null.
+export async function respondToEngagement(matchId, action) {
+  if (!supabase || !matchId) return null;
+  const { data, error } = await supabase.rpc("respond_to_engagement", { p_match: matchId, p_action: action });
+  return error ? null : data;
+}
+
+// Employer side: move an engagement's status directly (RLS permits it) and log
+// the subject event so the builder's trail shows what happened.
+export async function setEngagementStatus(matchId, status, builderId) {
+  if (!supabase || !matchId) return;
+  await supabase.from("engagements").update({ status }).eq("match_id", matchId);
+  if (builderId) await logSubjectAudit(builderId, { kind: "engagement-closed", status });
 }
 
 // Upserts the employer's company record, keyed on the signed-in owner.
@@ -270,7 +431,7 @@ export async function formSquad({ id, name, focus, pitch }) {
 // Persists the SOW draft and records the SROI derivation as a computed ledger
 // row — the same math the Finance screen runs, stored so impact figures are
 // reproducible rather than narrated. Each save appends a fresh computed_at row.
-export async function saveSow(handle, sow) {
+export async function saveSow(handle, sow, jurisdictionId) {
   if (!supabase) return;
   const employer = await myEmployer();
   if (!employer) return;
@@ -279,7 +440,7 @@ export async function saveSow(handle, sow) {
   const { data: m } = await supabase.from("matches").select("id, monthly_usd").eq("employer_id", employer.id).eq("builder_id", b.id).maybeSingle();
   if (!m) return;
   const { data: eng } = await supabase.from("engagements")
-    .upsert({ match_id: m.id, sow }, { onConflict: "match_id" })
+    .upsert({ match_id: m.id, sow, jurisdiction_id: jurisdictionId || null }, { onConflict: "match_id" })
     .select("id").single();
   if (!eng?.id) return;
   await logSubjectAudit(b.id, { kind: "sow-generated" });

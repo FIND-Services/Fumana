@@ -431,7 +431,18 @@ const APP_STAGE = {
 };
 const APP_STAGES = ["shortlisted", "interviewing", "sow"];
 
-function Applications({ builders, pipeline }) {
+function Applications({ builders, pipeline, onEngagementUpdate }) {
+  const toast = useToast();
+  const [responding, setResponding] = useState(null); // matchId being answered
+  // The builder's side of the lifecycle: the constrained RPC flips a drafted
+  // SOW to active or closed — the engagements table itself is employer-write.
+  async function respond(matchId, action) {
+    setResponding(matchId);
+    const status = await store.respondToEngagement(matchId, action);
+    if (status) { if (onEngagementUpdate) onEngagementUpdate(matchId, status); toast(status === "active" ? "SOW accepted. Your engagement is active." : "SOW declined. The engagement is closed."); }
+    else toast("Could not record your response right now.");
+    setResponding(null);
+  }
   const me = builders.find(b => b.isYou);
   const engagements = me
     ? APP_STAGES.flatMap(stage => pipeline[stage].filter(x => x.handle === me.handle).map(entry => ({ stage, entry })))
@@ -474,7 +485,7 @@ function Applications({ builders, pipeline }) {
         {engagements.length === 0
           ? <div style={{ marginTop: 10 }}><Card><p style={{ color: T.slate, fontSize: 14 }}>No employer engagements yet. Employers search the network by evidence. When one shortlists you, it appears here with its status.</p></Card></div>
           : <div style={{ display: "grid", gap: 12, marginTop: 10 }}>
-            {engagements.map((e, i) => { const s = APP_STAGE[e.stage]; return <Card key={i} accent={s.color}>
+            {engagements.map((e, i) => { const s = APP_STAGE[e.stage]; const eng = e.entry.engagement; return <Card key={i} accent={s.color}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12, flexWrap: "wrap" }}>
                 <div>
                   <div style={{ fontWeight: 600, fontSize: 15 }}>{e.entry.role}</div>
@@ -483,6 +494,21 @@ function Applications({ builders, pipeline }) {
                 </div>
                 <span style={{ fontFamily: F.mono, fontSize: 11, color: T.onAccent, background: s.color, borderRadius: 5, padding: "4px 10px", whiteSpace: "nowrap" }}>{s.label}</span>
               </div>
+              {e.stage === "sow" && eng && <div style={{ marginTop: 12, borderTop: `1px solid ${T.line}`, paddingTop: 12 }}>
+                {eng.status === "draft" && eng.sow && <div>
+                  <div style={{ fontFamily: F.mono, fontSize: 10.5, color: T.slate, textTransform: "uppercase", letterSpacing: 0.3, marginBottom: 8 }}>SOW ready for your review</div>
+                  <div style={{ fontSize: 14, fontWeight: 600 }}>{eng.sow.title}</div>
+                  {eng.sow.term && <div style={{ fontSize: 13, color: T.slate, marginTop: 3 }}>{eng.sow.term}</div>}
+                  {eng.jurisdiction && <div style={{ fontFamily: F.mono, fontSize: 11.5, color: T.slate, marginTop: 5 }}>Jurisdiction: {eng.jurisdiction.country} . settles in {eng.jurisdiction.currency_code}</div>}
+                  <div style={{ display: "flex", gap: 10, marginTop: 12 }}>
+                    <Btn small disabled={responding === e.entry.matchId} onClick={() => respond(e.entry.matchId, "accept")}>Accept SOW</Btn>
+                    <Btn small kind="ghost" disabled={responding === e.entry.matchId} onClick={() => respond(e.entry.matchId, "decline")}>Decline</Btn>
+                  </div>
+                </div>}
+                {eng.status === "draft" && !eng.sow && <div style={{ fontFamily: F.mono, fontSize: 11.5, color: T.slate }}>Offer in preparation — the SOW draft lands here.</div>}
+                {eng.status === "active" && <div style={{ fontFamily: F.mono, fontSize: 11.5, color: T.emerald }}>✓ Active engagement — SOW accepted{eng.jurisdiction ? ` . ${eng.jurisdiction.country}` : ""}</div>}
+                {eng.status === "closed" && <div style={{ fontFamily: F.mono, fontSize: 11.5, color: T.slate }}>This engagement is closed.</div>}
+              </div>}
             </Card>; })}
           </div>}
       </div>
@@ -697,6 +723,9 @@ const AUDIT_VIEW = {
   "pipeline-move": e => ({ label: "Application status changed", desc: `An employer moved your application to ${{ shortlisted: "shortlisted", interviewing: "interviewing", sow: "SOW pending" }[e.status] || e.status}.` }),
   "pipeline-withdrawn": () => ({ label: "Application withdrawn", desc: "An employer removed your profile from their pipeline." }),
   "sow-generated": () => ({ label: "SOW drafted", desc: "An employer generated a Statement of Work draft for your engagement." }),
+  "sow-accepted": () => ({ label: "SOW accepted", desc: "You accepted the Statement of Work. The engagement is active." }),
+  "sow-declined": () => ({ label: "SOW declined", desc: "You declined the Statement of Work. The engagement is closed." }),
+  "engagement-closed": () => ({ label: "Engagement closed", desc: "The employer closed this engagement." }),
 };
 
 function AuditTrail({ audit, onBack }) {
@@ -904,23 +933,48 @@ function FairnessPosture({ onBack }) {
   </div></Scroll>;
 }
 
-function Settings({ builders, onDelete, onFairness, onAudit, onReport, onEthics, logAudit, premium, onUpgrade, onManage, onSignOut }) {
+function Settings({ builders, onDelete, onDeleteAccount, onFairness, onAudit, onReport, onEthics, logAudit, premium, onUpgrade, onManage, onSignOut }) {
   const me = builders.find(b => b.isYou);
   const toast = useToast();
   const [lang, setLang] = useState("English");
   const [channels, setChannels] = useState({ whatsapp: true, sms: false, email: true });
-  const [twoFA, setTwoFA] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [deleted, setDeleted] = useState(false);
+  // TOTP 2FA: factors listed on mount; enrollment shows the QR + secret, then
+  // verifies a first code before the factor counts.
+  const [mfa, setMfa] = useState({ factors: null, enroll: null, code: "", err: "", busy: false });
+  useEffect(() => { store.mfaFactors().then(f => setMfa(s => ({ ...s, factors: f }))).catch(() => {}); }, []);
+  const mfaOn = (mfa.factors || []).some(f => f.status === "verified");
 
-  function exportData() {
-    const data = { profile: me || null, preferences: { language: lang, notifications: channels, twoFactor: twoFA }, note: "Illustrative export of the data Fumana holds about you. Real exports are assembled on the backend." };
+  async function mfaStart() {
+    setMfa(s => ({ ...s, busy: true, err: "" }));
+    const { data, error } = await store.mfaEnroll();
+    setMfa(s => ({ ...s, busy: false, enroll: data ? { id: data.id, qr: data.totp?.qr_code, secret: data.totp?.secret } : null, err: error ? error.message : "" }));
+  }
+  async function mfaConfirm() {
+    setMfa(s => ({ ...s, busy: true, err: "" }));
+    const { error } = await store.mfaVerify(mfa.enroll.id, mfa.code.trim());
+    if (error) { setMfa(s => ({ ...s, busy: false, err: error.message })); return; }
+    setMfa({ factors: [{ status: "verified" }], enroll: null, code: "", err: "", busy: false });
+    if (logAudit) logAudit({ kind: "2fa-enabled" });
+    toast("Two-factor authentication is on. You will need your authenticator app to sign in.");
+  }
+  async function mfaOff() {
+    const f = (await store.mfaFactors()).find(x => x.status === "verified");
+    if (f) await store.mfaUnenroll(f.id).catch(() => {});
+    setMfa(s => ({ ...s, factors: [] }));
+    toast("Two-factor authentication is off.");
+  }
+
+  async function exportData() {
     try {
+      const remote = await store.exportMyData();
+      const data = remote || { profile: me || null, preferences: { language: lang, notifications: channels }, note: "Local export — no backend configured, so this covers in-session data only." };
       const url = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: "application/json" }));
       const a = document.createElement("a"); a.href = url; a.download = "fumana-my-data.json"; a.click();
       URL.revokeObjectURL(url);
-      toast("Your data export downloaded.");
-    } catch { toast("Data export runs on the backend in production."); }
+      toast(remote ? "Your full data export downloaded." : "Local export downloaded.");
+    } catch { toast("Export failed right now."); }
     if (logAudit) logAudit({ kind: "data-export" });
   }
 
@@ -968,8 +1022,19 @@ function Settings({ builders, onDelete, onFairness, onAudit, onReport, onEthics,
     <div style={{ height: 14 }} />
 
     <Card><Label>Security</Label>
-      <div style={row}><div><div style={{ fontSize: 14 }}>Two-factor authentication</div><div style={{ color: T.slate, fontSize: 12.5, marginTop: 2 }}>Placeholder. Real 2FA enrolment is a backend step.</div></div>
-        <Toggle on={twoFA} label="Two-factor authentication" onClick={() => { setTwoFA(v => !v); toast("Two-factor setup runs on the backend."); }} /></div>
+      <div style={row}><div><div style={{ fontSize: 14 }}>Two-factor authentication</div><div style={{ color: T.slate, fontSize: 12.5, marginTop: 2 }}>{hasBackend ? "TOTP via an authenticator app. Required at sign-in once enabled." : "Needs a configured backend to enroll."}</div></div>
+        {hasBackend && <Btn small kind={mfaOn ? "ghost" : "primary"} onClick={mfaOn ? mfaOff : mfaStart} disabled={mfa.busy}>{mfaOn ? "Disable" : "Set up"}</Btn>}</div>
+      {mfa.enroll && <div style={{ marginTop: 12, background: T.paper, border: `1px solid ${T.line}`, borderRadius: 8, padding: 14 }}>
+        <div style={{ fontSize: 13.5, color: T.slate, marginBottom: 10 }}>Scan this with your authenticator app, then enter the 6-digit code.</div>
+        {mfa.enroll.qr && <div dangerouslySetInnerHTML={{ __html: mfa.enroll.qr }} style={{ marginBottom: 10 }} />}
+        {mfa.enroll.secret && <div style={{ fontFamily: F.mono, fontSize: 11.5, color: T.slate, marginBottom: 10 }}>Manual key: {mfa.enroll.secret}</div>}
+        <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+          <input value={mfa.code} onChange={e => setMfa(s => ({ ...s, code: e.target.value }))} placeholder="000000" maxLength={6} style={{ ...ctrl, marginTop: 0, width: 140, textAlign: "center", letterSpacing: 6 }} />
+          <Btn small onClick={mfaConfirm} disabled={mfa.busy || mfa.code.trim().length !== 6}>Enable</Btn>
+          <Btn small kind="ghost" onClick={() => setMfa(s => ({ ...s, enroll: null }))}>Cancel</Btn>
+        </div>
+        {mfa.err && <div style={{ fontFamily: F.mono, fontSize: 11.5, color: T.alert, marginTop: 8 }}>{mfa.err}</div>}
+      </div>}
       {onSignOut && <div style={row}><div><div style={{ fontSize: 14 }}>Sign out</div><div style={{ color: T.slate, fontSize: 12.5, marginTop: 2 }}>End this session on this device.</div></div>
         <Btn small kind="ghost" onClick={onSignOut}>Sign out</Btn></div>}
     </Card>
@@ -982,11 +1047,11 @@ function Settings({ builders, onDelete, onFairness, onAudit, onReport, onEthics,
         {!confirmDelete && !deleted && <Btn small kind="ghost" onClick={() => setConfirmDelete(true)}>Delete my data</Btn>}
       </div>
       {confirmDelete && !deleted && <div style={{ marginTop: 14, background: T.paper, border: `1px solid ${T.alert}`, borderRadius: 8, padding: 14 }}>
-        <div style={{ fontSize: 14, marginBottom: 10 }}>This removes your profile and data from the network. This cannot be undone.</div>
-        <div style={{ display: "flex", gap: 10 }}><Btn small kind="ghost" onClick={() => { setConfirmDelete(false); setDeleted(true); if (onDelete && me) onDelete(me.handle); if (logAudit) logAudit({ kind: "data-deletion" }); }}>Confirm delete</Btn><Btn small kind="ghost" onClick={() => setConfirmDelete(false)}>Cancel</Btn></div>
+        <div style={{ fontSize: 14, marginBottom: 10 }}>{hasBackend ? "This removes your profile, documents, media, review submissions, and your account. This cannot be undone." : "This removes your profile and data from the network. This cannot be undone."}</div>
+        <div style={{ display: "flex", gap: 10 }}><Btn small kind="ghost" onClick={() => { setConfirmDelete(false); if (logAudit) logAudit({ kind: "data-deletion" }); if (onDeleteAccount && hasBackend) { onDeleteAccount(); return; } setDeleted(true); if (onDelete && me) onDelete(me.handle); }}>Confirm delete</Btn><Btn small kind="ghost" onClick={() => setConfirmDelete(false)}>Cancel</Btn></div>
       </div>}
       {deleted && <div style={{ marginTop: 14, background: T.paper, border: `1px solid ${T.line}`, borderRadius: 8, padding: 14, fontSize: 13.5, color: T.slate }}>Deleted. Your profile is withdrawn from the network and no longer appears in employer search or Community.</div>}
-      <div style={{ marginTop: 12, fontFamily: F.mono, fontSize: 11, color: T.slate }}>This is the entry point to your data rights. Contest, human review, and the full data-rights flow arrive in the trust and safety phase.</div>
+      <div style={{ marginTop: 12, fontFamily: F.mono, fontSize: 11, color: T.slate }}>This is the entry point to your data rights. Contest and human review already file into the review queue from your dashboard.</div>
     </Card>
     <div style={{ height: 14 }} />
 
@@ -1462,7 +1527,7 @@ function UpgradeModal({ open, onClose, onComplete }) {
   </Modal>;
 }
 
-function CandidateApp({ addBuilder, removeBuilder, builders, pipeline, squads, joinSquad, leaveSquad, formSquad, audit, logAudit, submitReview, reviews, exit, toRole, me, onSignOut }) {
+function CandidateApp({ addBuilder, removeBuilder, builders, pipeline, squads, joinSquad, leaveSquad, formSquad, audit, logAudit, submitReview, reviews, exit, toRole, me, onSignOut, onDeleteAccount, onEngagementUpdate }) {
   // Session restore: when the backend returns my builder record, land on the
   // dashboard with the assessment reconstructed from it. `me` is the raw
   // builders row (snake_case).
@@ -1493,7 +1558,14 @@ function CandidateApp({ addBuilder, removeBuilder, builders, pipeline, squads, j
     const handle = "FB-" + Math.floor(1000 + Math.random() * 8999);
     const top = [...r.dimensions].sort((a, b) => b.score - a.score).slice(0, 3).map(d => d.name);
     const summary = `${profile.role || "Engineer"} with a ${r.tier.name} profile. Strongest in ${top.slice(0, 2).join(" and ")}. ${profile.experience.split(".")[0]}.`;
-    addBuilder({ handle, name: profile.name, city: profile.city, role: profile.role || "Engineer", summary, skills: top, profileStrength: r.profileStrength, tier: r.tier, dimensions: r.dimensions, experience: profile.experience, transcript: r.transcript, cv: profile.cv, accommodations, isYou: true });
+    // Media (pitch video, uploaded CV file) goes to the private builder-media
+    // bucket once the builder row exists and we know its id.
+    addBuilder({ handle, name: profile.name, city: profile.city, role: profile.role || "Engineer", summary, skills: top, profileStrength: r.profileStrength, tier: r.tier, dimensions: r.dimensions, experience: profile.experience, transcript: r.transcript, cv: profile.cv, accommodations, isYou: true })
+      .then(id => {
+        if (!id) return;
+        if (profile.pitchBlob) store.uploadMedia(id, profile.pitchBlob, "pitch.webm").catch(() => {});
+        if (profile.cvFile) store.uploadMedia(id, profile.cvFile, "cv-" + profile.cvFile.name.replace(/[^\w.-]/g, "_")).catch(() => {});
+      });
     setPublished(true); setScreen("dashboard");
     logAudit({ kind: "assessment-completed" });
     logAudit({ kind: "score-issued", profileStrength: r.profileStrength, tier: r.tier.name });
@@ -1504,19 +1576,19 @@ function CandidateApp({ addBuilder, removeBuilder, builders, pipeline, squads, j
     {screen === "signin" && <AuthFormPage role="builder" onBack={toRole} onAuthenticated={() => setScreen("consent")} />}
     {screen === "consent" && <Consent onNext={() => setScreen("onboarding")} onBack={() => setScreen("signin")} />}
     {screen === "onboarding" && <Onboarding profile={profile} setProfile={setProfile} onNext={() => setScreen("assessinfo")} onBack={() => setScreen("consent")} />}
-    {screen === "assessinfo" && <AssessInfo accommodations={accommodations} setAccommodations={setAccommodations} onOptIn={() => { if (accommodations.extraTime || accommodations.textOnly || accommodations.written) logAudit({ kind: "accommodations", ...accommodations }); setScreen("interview"); }} onOptOut={() => setScreen("humanreview")} onBack={() => setScreen("onboarding")} />}
+    {screen === "assessinfo" && <AssessInfo accommodations={accommodations} setAccommodations={setAccommodations} onOptIn={() => { if (accommodations.extraTime || accommodations.textOnly || accommodations.written) logAudit({ kind: "accommodations", ...accommodations }); setScreen("interview"); }} onOptOut={() => { const ref = "HR-" + Math.random().toString(36).slice(2, 7).toUpperCase(); if (submitReview) submitReview({ kind: "human-review", subject: "AI assessment declined", reason: "Candidate requested a human assessor instead of the AI interview", ref }); logAudit({ kind: "human-review", decision: "AI assessment declined", reason: "Candidate requested a human assessor", ref, source: "candidate" }); setScreen("humanreview"); }} onBack={() => setScreen("onboarding")} />}
     {screen === "humanreview" && <HumanReview onSwitch={() => setScreen("interview")} />}
     {screen === "interview" && <Interview profile={profile} accommodations={accommodations} onBack={() => setScreen("assessinfo")} onComplete={finish} />}
     {screen === "dashboard" && result && <Dashboard profile={profile} result={result} onUpskill={() => setScreen("upskill")} published={published} audit={audit} logAudit={logAudit} culture={culture} premium={premium} onUpgrade={openUpgrade} reviews={reviews} submitReview={submitReview} />}
     {screen === "upskill" && result && <Upskill result={result} points={points} setPoints={setPoints} culture={culture} setCulture={setCulture} logAudit={logAudit} premium={premium} onUpgrade={openUpgrade} />}
-    {screen === "applications" && <Applications builders={builders} pipeline={pipeline} />}
+    {screen === "applications" && <Applications builders={builders} pipeline={pipeline} onEngagementUpdate={onEngagementUpdate} />}
     {screen === "wallet" && <Wallet builders={builders} pipeline={pipeline} premium={premium} onUpgrade={openUpgrade} />}
     {screen === "coach" && <NegotiationCoach profile={profile} builders={builders} pipeline={pipeline} premium={premium} onUpgrade={openUpgrade} />}
     {screen === "worth" && <GlobalWorth profile={profile} builders={builders} pipeline={pipeline} premium={premium} onUpgrade={openUpgrade} />}
     {screen === "community" && <Community builders={builders} pipeline={pipeline} squads={squads} onJoin={joinSquad} onLeave={leaveSquad} onForm={formSquad} culture={culture} />}
     {screen === "alchemist" && <ExperienceAlchemist profile={profile} onBuildCV={() => setScreen("cvbuilder")} onSave={(res, raw) => { setProfile(p => ({ ...p, experience: raw })); store.saveAlchemist(res).catch(() => {}); store.saveBuilderDocs({ experience: raw }).catch(() => {}); }} />}
     {screen === "cvbuilder" && <CVBuilder profile={profile} saveCV={cv => { setProfile(p => ({ ...p, cv })); store.saveBuilderDocs({ cv }).catch(() => {}); }} onBack={() => setScreen("alchemist")} />}
-    {screen === "settings" && <Settings builders={builders} onDelete={removeBuilder} onFairness={() => setScreen("fairness")} onAudit={() => setScreen("audit")} onReport={() => setScreen("report")} onEthics={() => setScreen("ethics")} logAudit={logAudit} premium={premium} onUpgrade={openUpgrade} onManage={manageSub} onSignOut={onSignOut} />}
+    {screen === "settings" && <Settings builders={builders} onDelete={removeBuilder} onDeleteAccount={onDeleteAccount} onFairness={() => setScreen("fairness")} onAudit={() => setScreen("audit")} onReport={() => setScreen("report")} onEthics={() => setScreen("ethics")} logAudit={logAudit} premium={premium} onUpgrade={openUpgrade} onManage={manageSub} onSignOut={onSignOut} />}
     {screen === "fairness" && <FairnessPosture onBack={() => setScreen("settings")} />}
     {screen === "audit" && <AuditTrail audit={audit} onBack={() => setScreen("settings")} />}
     {screen === "report" && <ReportIssue categories={REPORT_CATS_CANDIDATE} source="candidate" logAudit={logAudit} submitReview={submitReview} onBack={() => setScreen("settings")} />}
@@ -1546,7 +1618,7 @@ function Consent({ onNext, onBack }) {
 // retake, and a playback preview. Recording is in-browser; upload and storage
 // are a backend step. (The interview uses pre-rendered clips, so there is no
 // live capture to reuse; this is built directly on MediaRecorder.)
-function PitchRecorder() {
+function PitchRecorder({ onBlob }) {
   const [phase, setPhase] = useState("idle"); // idle | recording | recorded | error
   const [remaining, setRemaining] = useState(60);
   const [error, setError] = useState("");
@@ -1582,6 +1654,7 @@ function PitchRecorder() {
         m.current.url = URL.createObjectURL(blob);
         stopTracks();
         setPhase("recorded");
+        if (onBlob) onBlob(blob);
       };
       rec.start();
       m.current.left = 60; setRemaining(60); setPhase("recording");
@@ -1621,13 +1694,18 @@ function PitchRecorder() {
       {phase === "error" && <Btn small onClick={start}>Try again</Btn>}
     </div>
     {error && <div role="alert" style={{ marginTop: 10, color: T.alert, fontSize: 13 }}>{error}</div>}
-    <div style={{ marginTop: 10, fontFamily: F.mono, fontSize: 11, color: T.slate }}>Recording happens in your browser. Upload and storage are a backend step.</div>
+    <div style={{ marginTop: 10, fontFamily: F.mono, fontSize: 11, color: T.slate }}>Recorded in your browser, stored privately with your profile. Employers can play it only after you commit to an interview.</div>
   </div>;
 }
 
 function Onboarding({ profile, setProfile, onNext, onBack }) {
   const [fileName, setFileName] = useState("");
-  function readFile(e) { const f = e.target.files?.[0]; if (!f) return; setFileName(f.name); if (/\.(txt|md)$/i.test(f.name)) { const r = new FileReader(); r.onload = () => setProfile(p => ({ ...p, experience: (p.experience ? p.experience + "\n" : "") + r.result })); r.readAsText(f); } }
+  function readFile(e) {
+    const f = e.target.files?.[0]; if (!f) return;
+    setFileName(f.name);
+    setProfile(p => ({ ...p, cvFile: f }));
+    if (/\.(txt|md)$/i.test(f.name)) { const r = new FileReader(); r.onload = () => setProfile(p => ({ ...p, experience: (p.experience ? p.experience + "\n" : "") + r.result })); r.readAsText(f); }
+  }
   const ready = profile.role && profile.experience.trim().length > 30;
   return <Scroll><div style={{ maxWidth: 640, margin: "0 auto" }} className="rise">
     <Back onClick={onBack} /><Eyebrow>Step 2 of 4 . Profile</Eyebrow>
@@ -1637,10 +1715,10 @@ function Onboarding({ profile, setProfile, onNext, onBack }) {
       <Field label="Full name" value={profile.name} onChange={v => setProfile(p => ({ ...p, name: v }))} placeholder="Stays hidden from employers until interview" />
       <div className="row2"><Field label="Role" value={profile.role} onChange={v => setProfile(p => ({ ...p, role: v }))} placeholder="Backend engineer" /><Field label="City" value={profile.city} onChange={v => setProfile(p => ({ ...p, city: v }))} placeholder="Lagos, Nigeria" /></div>
       <Field label="Your experience, in your words" rows={6} value={profile.experience} onChange={v => setProfile(p => ({ ...p, experience: v }))} placeholder="What have you built, what did you handle, what went wrong and how did you fix it." />
-      <div style={{ border: `1px dashed ${T.line}`, borderRadius: 10, padding: 16, textAlign: "center", background: T.paper }}><label style={{ cursor: "pointer", display: "inline-flex", flexDirection: "column", alignItems: "center", gap: 6, color: T.slate, fontSize: 13 }}><span style={{ fontFamily: F.mono, color: T.emerald }}>upload CV</span><span>{fileName || "txt or md reads in now. PDF and docx parse on the backend."}</span><input type="file" accept=".txt,.md,.pdf,.docx" onChange={readFile} style={{ display: "none" }} /></label></div>
+      <div style={{ border: `1px dashed ${T.line}`, borderRadius: 10, padding: 16, textAlign: "center", background: T.paper }}><label style={{ cursor: "pointer", display: "inline-flex", flexDirection: "column", alignItems: "center", gap: 6, color: T.slate, fontSize: 13 }}><span style={{ fontFamily: F.mono, color: T.emerald }}>upload CV</span><span>{fileName || "txt or md reads in now. PDF and docx are stored with your profile and parse on the backend."}</span><input type="file" accept=".txt,.md,.pdf,.docx" onChange={readFile} style={{ display: "none" }} /></label></div>
     </Card>
     <div style={{ height: 14 }} />
-    <Card><PitchRecorder /></Card>
+    <Card><PitchRecorder onBlob={b => setProfile(p => ({ ...p, pitchBlob: b }))} /></Card>
     <div style={{ marginTop: 16, marginBottom: 30 }}><Btn full disabled={!ready} onClick={onNext}>Continue</Btn><Hint show={!ready}>Add your role and a few sentences of experience to continue.</Hint></div>
   </div></Scroll>;
 }
@@ -1689,7 +1767,7 @@ function AssessInfo({ onOptIn, onOptOut, onBack, accommodations, setAccommodatio
 
 const HumanReview = ({ onSwitch }) => <Centered><div style={{ maxWidth: 460 }} className="rise">
   <Eyebrow>Human review requested</Eyebrow><h2 style={{ fontFamily: F.disp, fontWeight: 700, fontSize: 24, margin: "8px 0 8px" }}>A person will assess you</h2>
-  <Card><p style={{ fontSize: 14, color: T.slate, lineHeight: 1.6 }}>You declined AI assessment, which is your right. A human reviewer will complete your evaluation and your profile opens once they finish. In this prototype the human-review queue is stubbed, so no score is produced here.</p><div style={{ marginTop: 14 }}><Btn kind="ghost" small onClick={onSwitch}>Change my mind, use the AI interview</Btn></div></Card>
+  <Card><p style={{ fontSize: 14, color: T.slate, lineHeight: 1.6 }}>You declined AI assessment, which is your right. Your request is in the human-review queue with a reference, and a reviewer completes your evaluation before your profile opens. No score is produced until then.</p><div style={{ marginTop: 14 }}><Btn kind="ghost" small onClick={onSwitch}>Change my mind, use the AI interview</Btn></div></Card>
 </div></Centered>;
 
 // ---- Zuri voice: real TTS from the backend, SpeechSynthesis as fallback ----
@@ -1797,31 +1875,73 @@ function VideoStage({ src, autoPlay, playing, onPlay, onStop, muted }) {
 }
 
 function Interview({ profile, accommodations, onBack, onComplete }) {
-  // Scripted video interview: an intro clip, then five question clips. Zuri's
-  // voice is in each clip; the candidate answers each in turn. Scoring runs on
-  // the collected transcript, unchanged. Accommodations are honored: text-only
-  // drops the video for a pure-text path, written shows all questions as one
-  // form, and extra time confirms the (already untimed) no-auto-stop path.
+  // Adaptive interview: Zuri generates each next question from the experience
+  // and the transcript so far, probing the dimension least covered. When the
+  // model is unreachable the scripted clips stand in for that index — same
+  // five-question shape, and the transcript records whichever text was asked.
+  // Accommodations are honored: text-only drops video, written shows all
+  // questions as one form (generated up front), extra time is already untimed.
   const acc = accommodations || {};
   const [phase, setPhase] = useState("ready"); // ready | intro | qa | written | scoring
   const [idx, setIdx] = useState(0);
   const [qa, setQa] = useState([]);
+  const [qs, setQs] = useState([]);            // [{text, video|null}] — video only when the script clip stood in
+  const [qBusy, setQBusy] = useState(false);
   const [answer, setAnswer] = useState("");
   const [wAns, setWAns] = useState({});
   const [playing, setPlaying] = useState(false);
   const [err, setErr] = useState(false);
+  const { speak } = useZuriVoice();
   const total = INTERVIEW_SCRIPT.length;
-  const captionFor = i => INTERVIEW_SCRIPT[i].text || `Interview question ${i + 1}`;
+  const captionFor = i => qs[i]?.text || INTERVIEW_SCRIPT[i].text || `Interview question ${i + 1}`;
   const last = idx + 1 >= total;
   const activeAcc = ACCOMMODATIONS.filter(a => acc[a.id]);
   const ta = { width: "100%", background: T.paper, color: T.ink, border: `1px solid ${T.line}`, borderRadius: 8, padding: 11, fontSize: 14, resize: "vertical" };
 
-  function submit() {
-    if (answer.trim().length < 4) return;
+  // One next question for index qaSoFar.length, grounded in the transcript.
+  // On any model failure the scripted clip for that slot is the fallback, so
+  // the interview never stalls.
+  async function genNext(qaSoFar) {
+    const i = qaSoFar.length;
+    const sys = `You are Zuri, the interviewer inside Fumana. You are assessing a ${profile.role || "builder"} for global remote enterprise work across six dimensions: ${DIMENSIONS.join(", ")}. Given their experience and the interview so far, ask ONE next behavioral question that probes the dimension least covered so far. Keep it specific, warm, and plain, one or two sentences. Reference what they actually said when it helps. Return ONLY JSON, no fences: {"question":"..."}`;
+    const prior = qaSoFar.map((x, j) => `Q${j + 1}: ${x.q}\nA${j + 1}: ${x.a}`).join("\n\n") || "(nothing asked yet — this is the opening question)";
+    try {
+      const out = await callClaude({ system: sys, messages: [{ role: "user", content: `Experience:\n${profile.experience || "(none provided)"}\n\nInterview so far:\n${prior}` }], expectJson: true });
+      const t = (out?.question || "").trim();
+      if (t) return { text: t, video: null };
+    } catch { /* scripted fallback below */ }
+    return { text: INTERVIEW_SCRIPT[i]?.text || "", video: INTERVIEW_SCRIPT[i]?.video || null };
+  }
+
+  async function beginQa() {
+    setPhase("qa"); setQBusy(true);
+    const q = await genNext([]);
+    setQs([q]); setQBusy(false);
+    if (!q.video && !acc.textOnly) speak(q.text);
+  }
+
+  async function beginWritten() {
+    setPhase("written"); setQBusy(true);
+    const sys = `You are Zuri, the interviewer inside Fumana. Generate ${total} behavioral interview questions for a ${profile.role || "builder"} being assessed for global remote enterprise work, one probing each of these dimensions: ${DIMENSIONS.join(", ")}. Ground them in the experience given. Specific, warm, plain. Return ONLY JSON, no fences: {"questions":["...",...]} with exactly ${total} strings.`;
+    let list = [];
+    try {
+      const out = await callClaude({ system: sys, messages: [{ role: "user", content: `Experience:\n${profile.experience || "(none provided)"}` }], expectJson: true });
+      list = (out?.questions || []).map(t => ({ text: String(t || "").trim(), video: null })).filter(q => q.text);
+    } catch { /* scripted fallback below */ }
+    setQs(INTERVIEW_SCRIPT.map((s, i) => list[i] || { text: s.text, video: s.video }));
+    setQBusy(false);
+  }
+
+  async function submit() {
+    if (answer.trim().length < 4 || qBusy) return;
     const nextQa = [...qa, { q: captionFor(idx), a: answer.trim() }];
     setQa(nextQa); setAnswer(""); setPlaying(false);
     if (last) { score(nextQa); return; }
-    setIdx(idx + 1);
+    setQBusy(true);
+    const q = await genNext(nextQa);
+    setQs(prev => { const n = [...prev]; n[idx + 1] = q; return n; });
+    setQBusy(false); setIdx(idx + 1);
+    if (!q.video && !acc.textOnly) speak(q.text);
   }
   const writtenReady = INTERVIEW_SCRIPT.every((_, i) => (wAns[i] || "").trim().length >= 4);
   function submitWritten() {
@@ -1854,32 +1974,38 @@ function Interview({ profile, accommodations, onBack, onComplete }) {
     {activeAcc.length > 0 && <div style={{ maxWidth: 560, margin: "0 auto 16px", background: "rgba(6,110,90,0.06)", border: `1px solid ${T.emerald}`, borderRadius: 10, padding: "9px 13px", fontFamily: F.mono, fontSize: 11.5, color: T.vault, textAlign: "center" }}>Accommodations on: {activeAcc.map(a => a.label.toLowerCase()).join(", ")}</div>}
 
     {phase === "ready" && <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 18 }}>
-      <p style={{ color: T.slate, fontSize: 14 }}>{acc.written ? "All questions will be shown together as a form." : acc.textOnly ? "The questions will be shown as text, one at a time." : "Zuri will introduce herself, then ask her first question."}</p>
-      <Btn onClick={() => setPhase(acc.written ? "written" : acc.textOnly ? "qa" : "intro")}>Begin interview with Zuri</Btn>
+      <p style={{ color: T.slate, fontSize: 14 }}>{acc.written ? "Zuri will generate all questions from your profile, shown together as a form." : acc.textOnly ? "Zuri will generate each question as text, one at a time." : "Zuri will introduce herself, then ask her first question."}</p>
+      <Btn onClick={() => acc.written ? beginWritten() : acc.textOnly ? beginQa() : setPhase("intro")}>Begin interview with Zuri</Btn>
     </div>}
 
     {phase === "intro" && <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 16 }}>
       <VideoStage key="intro" src={INTERVIEW_INTRO.video} autoPlay playing={playing} onPlay={() => setPlaying(true)} onStop={() => setPlaying(false)} />
-      <Btn onClick={() => { setPlaying(false); setPhase("qa"); }}>Start the questions</Btn>
+      <Btn onClick={() => { setPlaying(false); beginQa(); }}>Start the questions</Btn>
     </div>}
 
     {phase === "qa" && <div style={{ display: "grid", gap: 14, justifyItems: "center" }}>
       <div style={{ fontFamily: F.mono, fontSize: 11, color: T.slate }}>question {idx + 1} of {total}</div>
-      {!acc.textOnly && <VideoStage key={INTERVIEW_SCRIPT[idx].id} src={INTERVIEW_SCRIPT[idx].video} autoPlay playing={playing} onPlay={() => setPlaying(true)} onStop={() => setPlaying(false)} />}
-      {INTERVIEW_SCRIPT[idx].text && <div style={{ maxWidth: 520, textAlign: "center", fontSize: 15 }}><b style={{ color: T.emerald, fontFamily: F.mono, fontSize: 12 }}>ZURI</b> . {INTERVIEW_SCRIPT[idx].text}</div>}
-      <div style={{ width: "100%", maxWidth: 560 }}>
-        <textarea rows={3} value={answer} onChange={e => setAnswer(e.target.value)} placeholder="Answer in a few honest sentences." style={{ width: "100%", background: T.paper, color: T.ink, border: `1px solid ${T.line}`, borderRadius: 8, padding: 11, fontSize: 14, resize: "vertical" }} />
-        <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 10 }}><Btn small disabled={answer.trim().length < 4} onClick={submit}>{last ? "Finish and score" : "Send answer"}</Btn></div>
-      </div>
+      {qBusy && <Spinner label="Zuri is forming your next question..." />}
+      {!qBusy && <>
+        {!acc.textOnly && (qs[idx]?.video
+          ? <VideoStage key={`q${idx}`} src={qs[idx].video} autoPlay playing={playing} onPlay={() => setPlaying(true)} onStop={() => setPlaying(false)} />
+          : <img src={zuriFace} alt="Zuri" style={{ width: 96, height: 96, borderRadius: "50%", border: `2px solid ${T.emerald}`, objectFit: "cover" }} />)}
+        <div style={{ maxWidth: 520, textAlign: "center", fontSize: 15 }}><b style={{ color: T.emerald, fontFamily: F.mono, fontSize: 12 }}>ZURI</b> . {captionFor(idx)}</div>
+        <div style={{ width: "100%", maxWidth: 560 }}>
+          <textarea rows={3} value={answer} onChange={e => setAnswer(e.target.value)} placeholder="Answer in a few honest sentences." style={{ width: "100%", background: T.paper, color: T.ink, border: `1px solid ${T.line}`, borderRadius: 8, padding: 11, fontSize: 14, resize: "vertical" }} />
+          <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 10 }}><Btn small disabled={answer.trim().length < 4} onClick={submit}>{last ? "Finish and score" : "Send answer"}</Btn></div>
+        </div>
+      </>}
       {answered}
     </div>}
 
     {phase === "written" && <div style={{ display: "grid", gap: 16, width: "100%", maxWidth: 620, margin: "0 auto" }}>
-      {INTERVIEW_SCRIPT.map((q, i) => <div key={q.id}>
+      {qBusy && <div style={{ display: "flex", justifyContent: "center" }}><Spinner label="Zuri is preparing your questions..." /></div>}
+      {!qBusy && INTERVIEW_SCRIPT.map((q, i) => <div key={q.id}>
         <div style={{ fontSize: 14, marginBottom: 6 }}><b style={{ color: T.emerald, fontFamily: F.mono, fontSize: 12 }}>Q{i + 1}</b> {captionFor(i)}</div>
         <textarea rows={3} value={wAns[i] || ""} onChange={e => setWAns(a => ({ ...a, [i]: e.target.value }))} placeholder="Answer in a few honest sentences." style={ta} />
       </div>)}
-      <div style={{ display: "flex", justifyContent: "flex-end" }}><Btn disabled={!writtenReady} onClick={submitWritten}>Finish and score</Btn></div>
+      {!qBusy && <div style={{ display: "flex", justifyContent: "flex-end" }}><Btn disabled={!writtenReady} onClick={submitWritten}>Finish and score</Btn></div>}
     </div>}
 
     {phase === "scoring" && <div style={{ display: "flex", justifyContent: "center" }}>{err
@@ -2277,7 +2403,7 @@ function EmpDashboard({ company, onEngage }) {
   </div></Scroll>;
 }
 
-function EmployerApp({ builders, pipeline, setPipeline, logAudit, submitReview, exit, toRole, employer, fx, onSignOut }) {
+function EmployerApp({ builders, pipeline, setPipeline, logAudit, submitReview, savedIds, jurisdictions, onEngagementUpdate, exit, toRole, employer, fx, onSignOut }) {
   // Session restore: a saved employer record skips onboarding and lands in-app.
   const [screen, setScreen] = useState(DEMO_SEED ? "app" : employer ? "app" : "welcome");
   const [tab, setTab] = useState("dashboard");
@@ -2302,8 +2428,21 @@ function EmployerApp({ builders, pipeline, setPipeline, logAudit, submitReview, 
     toast(`Interview requested with ${c.handle}. Identity revealed for the interview.`);
   };
   // Saved Builders store: the employer's private bookmarks from search.
+  // Saved builders persist in saved_builders; on hydrate the ids resolve back
+  // to cards from the network pool. Local-only (demo) cards have no id and
+  // stay in-memory.
   const [saved, setSaved] = useState([]);
-  const toggleSave = c => setSaved(s => s.some(x => x.handle === c.handle) ? s.filter(x => x.handle !== c.handle) : [...s, c]);
+  const syncedSaved = useRef(false);
+  useEffect(() => {
+    if (syncedSaved.current || !savedIds || !builders.length) return;
+    syncedSaved.current = true;
+    setSaved(builders.filter(b => savedIds.has(b.id)));
+  }, [savedIds, builders]);
+  const toggleSave = c => {
+    const removing = saved.some(x => x.handle === c.handle);
+    setSaved(s => removing ? s.filter(x => x.handle !== c.handle) : [...s, c]);
+    if (c.id) store.toggleSavedBuilder(c.id, !removing).catch(() => {});
+  };
   return <Shell role="employer" exit={exit} nav={inApp ? EMP_NAV : null} active={tab} onNav={setTab} showZuri={inApp}>
     {screen === "welcome" && <EmpWelcome onNext={() => setScreen("auth")} onBack={toRole} />}
     {screen === "auth" && <AuthFormPage role="employer" onBack={() => setScreen("welcome")} onAuthenticated={() => setScreen("company-info")} />}
@@ -2312,10 +2451,10 @@ function EmployerApp({ builders, pipeline, setPipeline, logAudit, submitReview, 
     {inApp && tab === "dashboard" && <EmpDashboard company={company} onEngage={() => setTab("engage")} />}
     {inApp && tab === "engage" && <Search builders={builders} pipeline={pipeline} onShortlist={shortlist} onRequestInterview={requestInterview} saved={saved} onToggleSave={toggleSave} />}
     {inApp && tab === "pipeline" && <Pipeline pipeline={pipeline} move={move} openSow={openSow} />}
-    {inApp && tab === "compliance" && <Compliance active={active} sow={sow} setSow={setSow} />}
+    {inApp && tab === "compliance" && <Compliance active={active} sow={sow} setSow={setSow} jurisdictions={jurisdictions} />}
     {inApp && tab === "investments" && <Finance pipeline={pipeline} fx={fx} />}
     {inApp && tab === "saved" && <SavedBuilders saved={saved} pipeline={pipeline} onToggleSave={toggleSave} />}
-    {inApp && tab === "team" && <MyTeam pipeline={pipeline} />}
+    {inApp && tab === "team" && <MyTeam pipeline={pipeline} onEngagementUpdate={onEngagementUpdate} />}
     {inApp && tab === "trust" && <TrustSafety pipeline={pipeline} onFairness={() => setTab("fairness")} onReport={() => setTab("report")} onEthics={() => setTab("ethics")} />}
     {inApp && tab === "fairness" && <FairnessPosture onBack={() => setTab("trust")} />}
     {inApp && tab === "report" && <ReportIssue categories={REPORT_CATS_EMPLOYER} source="employer" logAudit={logAudit} submitReview={submitReview} onBack={() => setTab("trust")} />}
@@ -2347,9 +2486,16 @@ function SavedBuilders({ saved, pipeline, onToggleSave }) {
 }
 
 // ---- My Team (employer). NO MODEL. Active SOW engagements, cost computed ----
-function MyTeam({ pipeline }) {
+function MyTeam({ pipeline, onEngagementUpdate }) {
+  const toast = useToast();
   const team = pipeline.sow;
-  const total = team.reduce((s, c) => s + (c.monthlyUsd || 0), 0);
+  // Closed engagements stop counting toward committed monthly spend.
+  const total = team.filter(c => c.engagement?.status !== "closed").reduce((s, c) => s + (c.monthlyUsd || 0), 0);
+  async function closeEngagement(c) {
+    await store.setEngagementStatus(c.matchId, "closed", c.id).catch(() => {});
+    if (onEngagementUpdate) onEngagementUpdate(c.matchId, "closed");
+    toast("Engagement closed.");
+  }
   return <Scroll><div style={{ maxWidth: 860, margin: "0 auto" }} className="rise">
     <Eyebrow>My Team</Eyebrow>
     <h2 style={{ fontFamily: F.disp, fontWeight: 700, fontSize: 26, margin: "6px 0 4px" }}>Your active engagements</h2>
@@ -2358,9 +2504,15 @@ function MyTeam({ pipeline }) {
       ? <Card><p style={{ color: T.slate, fontSize: 14 }}>No active engagements yet. Move a candidate to SOW pending to build your team.</p></Card>
       : <Card>
         <div style={{ display: "grid", gap: 1, background: T.line, border: `1px solid ${T.line}`, borderRadius: 8, overflow: "hidden" }}>
-          {team.map((c, i) => <div key={i} style={{ background: T.surface, padding: "12px 14px", display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12 }}>
-            <div><div style={{ fontWeight: 600, fontSize: 14 }}>{c.handle}</div><div style={{ color: T.slate, fontSize: 12.5 }}>{c.role}</div></div>
-            <div style={{ fontFamily: F.mono, fontSize: 15 }}>{usd(c.monthlyUsd || 0)}<span style={{ color: T.slate, fontSize: 11 }}> / mo</span></div>
+          {team.map((c, i) => <div key={i} style={{ background: T.surface, padding: "12px 14px", display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+            <div><div style={{ fontWeight: 600, fontSize: 14 }}>{c.handle}</div><div style={{ color: T.slate, fontSize: 12.5 }}>{c.role}</div>
+              <div style={{ fontFamily: F.mono, fontSize: 10.5, marginTop: 4, color: c.engagement?.status === "active" ? T.emerald : c.engagement?.status === "closed" ? T.alert : T.brass }}>
+                {!c.engagement ? "sow stage" : c.engagement.status === "active" ? "active" : c.engagement.status === "closed" ? "closed" : "awaiting builder acceptance"}
+              </div></div>
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <div style={{ fontFamily: F.mono, fontSize: 15 }}>{usd(c.monthlyUsd || 0)}<span style={{ color: T.slate, fontSize: 11 }}> / mo</span></div>
+              {c.engagement?.status === "active" && <Btn small kind="ghost" onClick={() => closeEngagement(c)}>End engagement</Btn>}
+            </div>
           </div>)}
         </div>
         <div style={{ display: "flex", justifyContent: "space-between", marginTop: 14, fontFamily: F.mono, fontSize: 13 }}><span style={{ color: T.slate }}>total monthly, computed</span><span style={{ color: T.emerald, fontWeight: 600 }}>{usd(total)}</span></div>
@@ -2393,6 +2545,8 @@ function Account({ company, setCompany, onSignOut }) {
       {onSignOut && <Btn kind="ghost" small onClick={onSignOut}>Sign out</Btn>}</div>
     <div style={{ marginTop: 10, fontFamily: F.mono, fontSize: 11, color: T.slate }}>Company profile, billing, and verification run on the backend.</div>
     <div style={{ height: 14 }} />
+    <DomainVerify company={company} />
+    <div style={{ height: 14 }} />
     <Card><Label>Text size</Label>
       <p style={{ fontSize: 13.5, color: T.slate, margin: "8px 0 10px" }}>Scale the whole app for easier reading.</p>
       <FontSizeToggle />
@@ -2401,10 +2555,57 @@ function Account({ company, setCompany, onSignOut }) {
   </div></Scroll>;
 }
 
+// Domain verification: the employer publishes a DNS TXT record
+// (fumana-verify=<token>) on their company domain; the verify-domain edge
+// function does the lookup over DNS-over-HTTPS and flips domain_verified.
+function DomainVerify({ company }) {
+  const toast = useToast();
+  const [state, setState] = useState(null); // {domain, token, verified}
+  const [busy, setBusy] = useState(false);
+  async function issue() {
+    if (!hasBackend) { toast("Domain verification needs a configured backend."); return; }
+    setBusy(true);
+    const r = await store.verifyDomain("issue");
+    setBusy(false);
+    if (r && !r.error) setState(r);
+    else toast(r?.error || "Save your company profile first — the domain field must be set.");
+  }
+  async function check() {
+    setBusy(true);
+    const r = await store.verifyDomain("check");
+    setBusy(false);
+    if (r?.verified) { setState(s => ({ ...s, verified: true })); toast("Domain verified."); }
+    else toast("Record not found yet — DNS changes can take a few minutes to propagate.");
+  }
+  return <Card><Label>Domain verification</Label>
+    {state?.verified
+      ? <p style={{ fontSize: 14, color: T.emerald, margin: "8px 0 0" }}>{state.domain} is verified. Your organization shows as verified to builders.</p>
+      : state
+        ? <>
+          <p style={{ fontSize: 13.5, color: T.slate, margin: "8px 0 8px" }}>Add this TXT record to <b>{state.domain}</b> at your DNS provider, then check:</p>
+          <code style={{ display: "block", fontFamily: F.mono, fontSize: 12, background: T.mute, borderRadius: 6, padding: "9px 12px", marginBottom: 10, wordBreak: "break-all" }}>fumana-verify={state.token}</code>
+          <Btn small onClick={check} disabled={busy}>{busy ? "Checking…" : "I added the record — check DNS"}</Btn>
+        </>
+        : <>
+          <p style={{ fontSize: 13.5, color: T.slate, margin: "8px 0 10px" }}>{company.domain ? `Prove you control ${company.domain} by publishing a DNS TXT record. Verified organizations carry a badge.` : "Set your work email domain above and save, then verify it here."}</p>
+          <Btn small kind="ghost" onClick={issue} disabled={busy || !company.domain}>{busy ? "Issuing…" : "Get verification token"}</Btn>
+        </>}
+  </Card>;
+}
+
 // One bias-shielded result card. Locked shows fit + handle + skills (evidence);
 // role and summary are revealed only once the employer has requested an interview.
 // No name, photo, or location is ever rendered (the network entry has none).
 function SearchCard({ c, isRevealed, isShort, isIn, isSaved, budget, onShortlist, onRequestInterview, onToggleSave }) {
+  // Pitch playback: the 60s recording is only fetchable post-reveal — the
+  // storage policy mirrors the builders reveal grant.
+  const [pitch, setPitch] = useState(null);
+  const [pitchState, setPitchState] = useState(""); // "" | "loading" | "none"
+  async function playPitch() {
+    setPitchState("loading");
+    const u = await store.mediaUrl(c.id, "pitch.webm");
+    if (u) setPitch(u); else setPitchState("none");
+  }
   return <Card accent={isRevealed ? T.emerald : T.line}>
     <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12, flexWrap: "wrap" }}>
       <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
@@ -2418,6 +2619,9 @@ function SearchCard({ c, isRevealed, isShort, isIn, isSaved, budget, onShortlist
     {isRevealed
       ? <p style={{ fontSize: 14, color: T.ink, marginBottom: 12 }}>{c.summary}</p>
       : <div style={{ border: `1px dashed ${T.line}`, borderRadius: 8, padding: "10px 12px", marginBottom: 12, fontSize: 13, color: T.slate, background: T.paper }}>Role and summary are shielded. Request an interview to reveal them and commit to this builder.</div>}
+    {isRevealed && !pitch && pitchState !== "none" && <button onClick={playPitch} disabled={pitchState === "loading"} style={{ background: "none", border: "none", fontFamily: F.mono, fontSize: 11, color: T.emerald, cursor: "pointer", padding: "0 0 10px", textDecoration: "underline" }}>{pitchState === "loading" ? "loading pitch..." : "play 60s pitch"}</button>}
+    {pitch && <video src={pitch} controls autoPlay style={{ width: "100%", borderRadius: 8, marginBottom: 12, background: T.ink }} />}
+    {pitchState === "none" && <div style={{ fontFamily: F.mono, fontSize: 11, color: T.slate, marginBottom: 10 }}>No pitch recording on file.</div>}
     <div style={{ display: "flex", justifyContent: "space-between", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
       <div style={{ display: "flex", gap: 14, alignItems: "center", flexWrap: "wrap" }}><Btn kind="ghost" small onClick={() => onToggleSave(c)}>{isSaved ? "Saved" : "Save"}</Btn><ReviewLink what={`Search fit for ${c.handle}: ${c.fit}%`} source="employer" /></div>
       <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
@@ -2572,15 +2776,18 @@ function TrustSafety({ pipeline, onFairness, onReport, onEthics }) {
   </div></Scroll>;
 }
 
-function Compliance({ active, sow, setSow }) {
+function Compliance({ active, sow, setSow, jurisdictions }) {
   const [busy, setBusy] = useState(false); const [err, setErr] = useState("");
+  const [jurisId, setJurisId] = useState("");
+  const eng = active?.engagement || null;
   if (!active) return <Scroll><div style={{ maxWidth: 760, margin: "0 auto" }} className="rise"><Card><p style={{ color: T.slate, fontSize: 14 }}>Move a candidate to SOW pending and select Generate SOW to open the compliance hub.</p></Card></div></Scroll>;
+  const juris = (jurisdictions || []).find(j => j.id === (jurisId || eng?.jurisdiction_id)) || null;
   async function gen() {
     setBusy(true); setErr("");
     try {
       const sys = "You are the Telos Compliance Agent, acting as Employer of Record for Fumana. Draft a concise Statement of Work for an enterprise client engaging a vetted builder through Fumana. Fumana acts as the IP custodian and as the legal Employer of Record, assuming local employment liability and tax remittance. Use general, honest language only. Do not assert specific tax rates and do not make jurisdiction-specific legal claims. Return ONLY JSON, no fences. Shape: {\"title\":string,\"scope\":[string],\"deliverables\":[string],\"ip_clause\":string,\"eor_note\":string,\"term\":string}. Keep each line tight. No em dashes.";
-      const out = await callClaude({ system: sys, messages: [{ role: "user", content: `Builder: ${active.handle}, ${active.role}. Monthly USD ${active.monthlyUsd}. Context: ${active.summary}` }], expectJson: true });
-      setSow(out); store.saveSow(active.handle, out).catch(() => {});
+      const out = await callClaude({ system: sys, messages: [{ role: "user", content: `Builder: ${active.handle}, ${active.role}. Monthly USD ${active.monthlyUsd}. Jurisdiction: ${juris?.country || "not specified"}. Context: ${active.summary}` }], expectJson: true });
+      setSow(out); store.saveSow(active.handle, out, juris?.id).catch(() => {});
     } catch (e) {
       setErr(String(e).includes("501") ? "config" : "fail");
     }
@@ -2589,7 +2796,16 @@ function Compliance({ active, sow, setSow }) {
   return <Scroll><div style={{ maxWidth: 820, margin: "0 auto" }} className="rise">
     <Eyebrow>Legal and compliance hub</Eyebrow><h2 style={{ fontFamily: F.disp, fontWeight: 700, fontSize: 26, margin: "6px 0 4px" }}>Statement of Work for {active.handle}</h2>
     <p style={{ color: T.slate, fontSize: 15, marginBottom: 14 }}>Fumana signs as Employer of Record and assumes local employment liability, tax remittance, and IP custody.</p>
-    <div style={{ marginBottom: 14, display: "inline-flex", alignItems: "center", gap: 8, fontFamily: F.mono, fontSize: 12, color: T.emerald, border: `1px solid ${T.emerald}`, borderRadius: 6, padding: "5px 11px" }}>&#10003; liability assumed</div>
+    <div style={{ marginBottom: 14, display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+      <span style={{ display: "inline-flex", alignItems: "center", gap: 8, fontFamily: F.mono, fontSize: 12, color: T.emerald, border: `1px solid ${T.emerald}`, borderRadius: 6, padding: "5px 11px" }}>&#10003; liability assumed</span>
+      <span style={{ fontFamily: F.mono, fontSize: 11, color: T.onAccent, background: eng?.status === "active" ? T.emerald : eng?.status === "closed" ? T.alert : T.brass, borderRadius: 5, padding: "4px 10px" }}>
+        {eng?.status === "active" ? "SOW accepted . active" : eng?.status === "closed" ? "engagement closed" : sow || eng?.sow ? "draft . awaiting builder acceptance" : "not yet drafted"}
+      </span>
+      {(jurisdictions || []).length > 0 && <select value={jurisId || eng?.jurisdiction_id || ""} onChange={e => setJurisId(e.target.value)} style={{ background: T.paper, color: T.ink, border: `1px solid ${T.line}`, borderRadius: 8, padding: "7px 10px", fontSize: 13 }}>
+        <option value="">Jurisdiction: choose</option>
+        {jurisdictions.map(j => <option key={j.id} value={j.id}>{j.country} ({j.currency_code})</option>)}
+      </select>}
+    </div>
     {!sow && <div>
       {busy ? <Spinner label="The Telos Compliance Agent is drafting the SOW..." /> : <Btn onClick={gen}>Generate localized SOW</Btn>}
       {!busy && err === "config" && <div style={{ marginTop: 12, fontSize: 13.5, color: T.slate }}>The Telos Compliance Agent is ready and wired through the model proxy. It lights up the moment a model provider is connected.</div>}
@@ -2598,6 +2814,7 @@ function Compliance({ active, sow, setSow }) {
     {sow && <Card accent={T.brass}>
       <div style={{ marginBottom: 14, background: T.paper, border: `1px solid ${T.brass}`, borderRadius: 8, padding: "10px 12px", fontSize: 12.5, color: T.slate }}><b style={{ color: T.ink }}>Draft only.</b> A starting point for legal review, not a binding document. General terms; a lawyer confirms specifics per jurisdiction.</div>
       <div style={{ fontFamily: F.disp, fontWeight: 700, fontSize: 18 }}>{sow.title}</div>
+      {juris && <div style={{ fontFamily: F.mono, fontSize: 11.5, color: T.slate, marginTop: 6 }}>Jurisdiction: {juris.country} . settles in {juris.currency_code}. Statutory notes are general; specifics are confirmed per jurisdiction at signing.</div>}
       <SowList label="Scope" items={sow.scope} />
       <SowList label="Deliverables" items={sow.deliverables} />
       <Mini label="IP custody" body={sow.ip_clause} />
@@ -2923,6 +3140,48 @@ function Shell({ role, exit, nav, active, onNav, children, showZuri, premiumBadg
 // ============================================================
 // ROOT
 // ============================================================
+// Admin console: the review queue (contests, human-review requests, reports)
+// with resolution. Reached only via the role screen when the signed-in account
+// carries the app_metadata admin claim; the RLS policies enforce the same
+// boundary server-side, so this panel never shows or edits for non-admins.
+function AdminQueue({ reviews, onResolve, onExit, onSignOut }) {
+  const [draft, setDraft] = useState({});
+  const order = { open: 0, in_review: 1, resolved: 2 };
+  const sorted = [...reviews].sort((a, b) => (order[a.status] ?? 3) - (order[b.status] ?? 3));
+  return <Scroll><div style={{ maxWidth: 860, margin: "0 auto" }} className="rise">
+    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+      <Eyebrow>Admin . Review queue</Eyebrow>
+      <div style={{ display: "flex", gap: 10 }}>
+        <Btn small kind="ghost" onClick={onExit}>Exit</Btn>
+        {onSignOut && <Btn small kind="ghost" onClick={onSignOut}>Sign out</Btn>}
+      </div>
+    </div>
+    <h2 style={{ fontFamily: F.disp, fontWeight: 700, fontSize: 26, margin: "6px 0 4px" }}>Review queue</h2>
+    <p style={{ color: T.slate, fontSize: 15, marginBottom: 18 }}>Every contest, human-review request, and report filed on the network. Resolve them here — the builder's markers clear when a row closes.</p>
+    {sorted.length === 0 && <Card><p style={{ fontSize: 14, color: T.slate, margin: 0 }}>The queue is empty.</p></Card>}
+    {sorted.map(r => <Card key={r.id || r.ref} accent={r.status === "open" ? T.brass : T.line}>
+      <div style={{ display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
+        <div>
+          <div style={{ fontFamily: F.mono, fontSize: 11, color: T.slate }}>{r.kind || "review"}{r.ref ? ` . ${r.ref}` : ""} . {String(r.created_at || "").slice(0, 10)}</div>
+          <div style={{ fontWeight: 600, fontSize: 15, margin: "4px 0 2px" }}>{r.subject || r.kind}</div>
+          {r.reason && <div style={{ fontSize: 13.5, color: T.slate }}>{r.reason}</div>}
+          {r.resolution && <div style={{ fontSize: 12.5, color: T.emerald, marginTop: 6, fontFamily: F.mono }}>Resolved: {r.resolution}</div>}
+        </div>
+        <span style={{ fontFamily: F.mono, fontSize: 11, color: r.status === "resolved" ? T.emerald : r.status === "in_review" ? T.brass : T.slate, border: `1px solid ${r.status === "resolved" ? T.emerald : T.line}`, borderRadius: 4, padding: "3px 9px", whiteSpace: "nowrap", height: "fit-content" }}>{r.status}</span>
+      </div>
+      {r.status !== "resolved" && <div style={{ marginTop: 12, borderTop: `1px solid ${T.mute}`, paddingTop: 12 }}>
+        <textarea value={draft[r.id] || ""} onChange={e => setDraft(d => ({ ...d, [r.id]: e.target.value }))} placeholder="Resolution note (sent with the resolved state)" rows={2}
+          style={{ width: "100%", background: T.paper, color: T.ink, border: `1px solid ${T.line}`, borderRadius: 8, padding: 10, fontSize: 13.5, fontFamily: F.body, resize: "vertical" }} />
+        <div style={{ display: "flex", gap: 10, marginTop: 8 }}>
+          {r.status === "open" && <Btn small kind="ghost" onClick={() => onResolve(r.id, "in_review")}>Mark in review</Btn>}
+          <Btn small onClick={() => onResolve(r.id, "resolved", draft[r.id] || "")}>Resolve</Btn>
+        </div>
+      </div>}
+    </Card>)}
+    <div style={{ height: 30 }} />
+  </div></Scroll>;
+}
+
 export default function App() {
   const [view, setView] = useState("landing");
   const [builders, setBuilders] = useState(SEED_BUILDERS);
@@ -2932,6 +3191,11 @@ export default function App() {
   // Review-queue rows I filed (contests, human reviews, reports) — drives the
   // "under review" markers so they clear when a reviewer resolves them.
   const [reviews, setReviews] = useState(null);
+  // My employer's persisted saved-builder ids; EmployerApp resolves them to
+  // cards from the builders pool.
+  const [savedIds, setSavedIds] = useState(null);
+  // Jurisdictions for SOW drafting (Nigeria, Kenya, Ghana seeds).
+  const [jurisdictions, setJurisdictions] = useState([]);
   // Password recovery: the reset link lands here with a recovery session and
   // the app shows the set-new-password screen instead of the landing page.
   const [recovery, setRecovery] = useState(false);
@@ -2940,6 +3204,9 @@ export default function App() {
   const [me, setMe] = useState(null);
   const [myEmployer, setMyEmployer] = useState(null);
   const [fx, setFx] = useState(null);
+  // Admin role claim (app_metadata.role='admin', server-set) — unlocks the
+  // review-queue console.
+  const [isAdmin, setIsAdmin] = useState(false);
 
   // Hydrate the shared store from Supabase when configured. Without a backend
   // (or on any failure) the seeded in-memory state stays — demo posture is
@@ -2947,37 +3214,52 @@ export default function App() {
   // Collections merge rather than replace: anything the user created locally
   // while the network call was in flight is kept, so a slow hydrate cannot
   // clobber a just-finished assessment or squad.
+  const applyNet = net => {
+    setBuilders(prev => {
+      const local = new Map(prev.map(b => [b.id || b.handle, b]));
+      for (const r of net.builders) { const k = r.id || r.handle; if (!local.has(k)) local.set(k, r); }
+      return [...local.values()];
+    });
+    setPipeline(prev => {
+      const sig = p => ["shortlisted", "interviewing", "sow"].map(k => p[k].map(e => e.handle).join(",")).join("|");
+      // Never wipe local work for an empty remote; otherwise adopt the remote
+      // layout when the stages differ (realtime refreshes land here too).
+      if (sig(prev) === sig(net.pipeline)) return prev;
+      if (!Object.values(net.pipeline).some(s => s.length) && Object.values(prev).some(s => s.length)) return prev;
+      return net.pipeline;
+    });
+    setSquads(prev => {
+      const seen = new Set(prev.map(s => s.id));
+      const merged = prev.map(s => {
+        const remote = net.squads.find(n => n.id === s.id);
+        return remote ? { ...remote, joined: s.joined } : s;
+      });
+      return [...merged, ...net.squads.filter(n => !seen.has(n.id))];
+    });
+    setAudit(prev => {
+      const seen = new Set(prev.map(e => `${e.kind}:${e.at}`));
+      return [...prev, ...net.audit.filter(e => !seen.has(`${e.kind}:${e.at}`))];
+    });
+    setReviews(net.reviews || []);
+    if (net.savedIds) setSavedIds(new Set(net.savedIds));
+    if (net.jurisdictions) setJurisdictions(net.jurisdictions);
+    if (net.fx) setFx(net.fx);
+    setIsAdmin(!!net.isAdmin);
+    setMe(net.me ? { ...net.me, docs: net.docs } : null);
+    setMyEmployer(net.employer || null);
+  };
+
   useEffect(() => {
     let live = true;
-    store.loadNetwork()
-      .then(net => {
-        if (!live || !net) return;
-        setBuilders(prev => {
-          const local = new Map(prev.map(b => [b.id || b.handle, b]));
-          for (const r of net.builders) { const k = r.id || r.handle; if (!local.has(k)) local.set(k, r); }
-          return [...local.values()];
-        });
-        setPipeline(prev => Object.values(prev).some(s => s.length) ? prev : net.pipeline);
-        setSquads(prev => {
-          const seen = new Set(prev.map(s => s.id));
-          const merged = prev.map(s => {
-            const remote = net.squads.find(n => n.id === s.id);
-            return remote ? { ...remote, joined: s.joined } : s;
-          });
-          return [...merged, ...net.squads.filter(n => !seen.has(n.id))];
-        });
-        setAudit(prev => {
-          const seen = new Set(prev.map(e => `${e.kind}:${e.at}`));
-          return [...prev, ...net.audit.filter(e => !seen.has(`${e.kind}:${e.at}`))];
-        });
-        setReviews(net.reviews || []);
-        if (net.fx) setFx(net.fx);
-        setMe(net.me ? { ...net.me, docs: net.docs } : null);
-        setMyEmployer(net.employer || null);
-      })
-      .catch(() => {});
+    store.loadNetwork().then(net => { if (live && net) applyNet(net); }).catch(() => {});
     return () => { live = false; };
   }, []);
+
+  // Realtime: matches and reviews are published on supabase_realtime; any
+  // change re-runs the same hydrate merge so both portals stay in sync.
+  useEffect(() => store.subscribeNetwork(() => {
+    store.loadNetwork().then(net => { if (net) applyNet(net); }).catch(() => {});
+  }), []);
 
   // Every mutation writes through to the store. Each store call no-ops without
   // a backend, so these stay correct in both postures.
@@ -2985,7 +3267,14 @@ export default function App() {
   // Optimistic queue row + durable write; the local row makes "under review"
   // appear immediately without waiting for a reload.
   const submitReview = r => { setReviews(prev => [{ status: "open", created_at: new Date().toISOString(), ...r }, ...(prev || [])]); store.submitReview(r).catch(() => {}); };
-  const addBuilder = b => { setBuilders(prev => [b, ...prev]); store.addBuilder(b).catch(() => {}); };
+  // Admin: move a queue row to in_review or resolved. RLS rejects this write
+  // for anyone without the admin claim; the optimistic patch only ever runs
+  // where the console is shown.
+  const resolveReview = (id, status, resolution) => {
+    setReviews(prev => (prev || []).map(r => r.id === id ? { ...r, status, resolution } : r));
+    store.resolveReview(id, status, resolution).catch(() => {});
+  };
+  const addBuilder = b => { setBuilders(prev => [b, ...prev]); return store.addBuilder(b).catch(() => null); };
   // Data deletion: remove the builder from the shared network store, so the
   // profile stops appearing in employer search and in Community. This is what
   // makes "delete my data" a real removal rather than a logged intention.
@@ -3003,6 +3292,13 @@ export default function App() {
   // Real sign-out: clears the Supabase session token and the restored
   // identities so the next visit starts signed out, then lands home.
   const signOut = () => { authSignOut().finally(() => { setMe(null); setMyEmployer(null); setView("landing"); }); };
+  // Full account deletion: the RPC removes every owned row plus the auth
+  // user; afterwards there is no session to sign out of, just land home.
+  const deleteAccount = () => { store.deleteAccount().finally(() => { setMe(null); setMyEmployer(null); setView("landing"); }); };
+  // Optimistically patch an engagement's lifecycle status on the pipeline card
+  // that carries it. The store call that drove the change handles persistence.
+  const updateEngagement = (matchId, status) => setPipeline(prev =>
+    Object.fromEntries(Object.entries(prev).map(([k, arr]) => [k, arr.map(e => e.matchId === matchId && e.engagement ? { ...e, engagement: { ...e.engagement, status } } : e)])));
 
   // Recovery links land as #...&type=recovery and emit PASSWORD_RECOVERY.
   // Either signal parks the app on the set-new-password screen.
@@ -3011,6 +3307,9 @@ export default function App() {
     if (/type=recovery/.test(window.location.hash)) setRecovery(true);
     const { data: { subscription } } = supabase.auth.onAuthStateChange(evt => {
       if (evt === "PASSWORD_RECOVERY") setRecovery(true);
+      // A sign-in mid-session needs a re-hydrate: the restored builder/employer
+      // records and the admin claim only populate from loadNetwork.
+      if (evt === "SIGNED_IN") store.loadNetwork().then(net => { if (net) applyNet(net); }).catch(() => {});
     });
     return () => subscription.unsubscribe();
   }, []);
@@ -3026,9 +3325,10 @@ export default function App() {
       <ToastProvider>
         <HumanReviewProvider logAudit={logAudit} submitReview={submitReview}>
           {view === "landing" && <div style={marketingFont}><LandingPage onSignInClick={toRole} /></div>}
-          {view === "role" && <div style={marketingFont}><RoleSelectionPage onRoleSelect={r => setView(r === "builder" ? "candidate" : "employer")} onBack={() => setView("landing")} /></div>}
-          {view === "candidate" && <CandidateApp addBuilder={addBuilder} removeBuilder={removeBuilder} builders={builders} pipeline={pipeline} squads={squads} joinSquad={joinSquad} leaveSquad={leaveSquad} formSquad={formSquad} audit={audit} logAudit={logAudit} submitReview={submitReview} reviews={reviews} exit={() => setView("landing")} toRole={toRole} me={me} onSignOut={signOut} />}
-          {view === "employer" && <EmployerApp builders={builders} pipeline={pipeline} setPipeline={setPipelinePersist} logAudit={logAudit} submitReview={submitReview} exit={() => setView("landing")} toRole={toRole} employer={myEmployer} fx={fx} onSignOut={signOut} />}
+          {view === "role" && <div style={marketingFont}><RoleSelectionPage isAdmin={isAdmin} onRoleSelect={r => setView(r === "admin" ? "admin" : r === "builder" ? "candidate" : "employer")} onBack={() => setView("landing")} /></div>}
+          {view === "admin" && <AdminQueue reviews={reviews || []} onResolve={resolveReview} onExit={() => setView("landing")} onSignOut={signOut} />}
+          {view === "candidate" && <CandidateApp addBuilder={addBuilder} removeBuilder={removeBuilder} builders={builders} pipeline={pipeline} squads={squads} joinSquad={joinSquad} leaveSquad={leaveSquad} formSquad={formSquad} audit={audit} logAudit={logAudit} submitReview={submitReview} reviews={reviews} exit={() => setView("landing")} toRole={toRole} me={me} onSignOut={signOut} onDeleteAccount={deleteAccount} onEngagementUpdate={updateEngagement} />}
+          {view === "employer" && <EmployerApp builders={builders} pipeline={pipeline} setPipeline={setPipelinePersist} logAudit={logAudit} submitReview={submitReview} savedIds={savedIds} jurisdictions={jurisdictions} onEngagementUpdate={updateEngagement} exit={() => setView("landing")} toRole={toRole} employer={myEmployer} fx={fx} onSignOut={signOut} />}
         </HumanReviewProvider>
       </ToastProvider>
     </FontSizeCtx.Provider>

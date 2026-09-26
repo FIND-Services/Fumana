@@ -18,6 +18,10 @@ export function AuthFormPage({ role, onBack, onAuthenticated }: { role: string; 
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
+  // Second factor: set when sign-in succeeds at aal1 but the account has a
+  // verified TOTP factor (aal2 required).
+  const [mfaFactorId, setMfaFactorId] = useState('');
+  const [mfaCode, setMfaCode] = useState('');
 
   // With no backend configured the form falls through to onAuthenticated,
   // preserving the prototype's facade auth. With Supabase set these are real.
@@ -35,6 +39,25 @@ export function AuthFormPage({ role, onBack, onAuthenticated }: { role: string; 
       setIsSignUp(false);
       return;
     }
+    // If the account has a verified TOTP factor, the session is at aal1 and
+    // needs a second-factor challenge before it counts.
+    const { data: aal } = await supabase.auth.mfa.getAuthenticatorAssuranceLevel();
+    if (aal?.currentLevel === 'aal1' && aal?.nextLevel === 'aal2') {
+      const { data: f } = await supabase.auth.mfa.listFactors();
+      const totp = (f?.totp || []).find((x: { status: string }) => x.status === 'verified');
+      if (totp) { setMfaFactorId(totp.id); setNotice('Enter the 6-digit code from your authenticator app.'); return; }
+    }
+    onAuthenticated();
+  }
+
+  async function submitMfa(e: React.FormEvent) {
+    e.preventDefault();
+    if (!supabase || !mfaFactorId) return;
+    setBusy(true); setError('');
+    const { data: ch, error: cErr } = await supabase.auth.mfa.challenge({ factorId: mfaFactorId });
+    const vErr = cErr ? cErr : (await supabase.auth.mfa.verify({ factorId: mfaFactorId, challengeId: ch!.id, code: mfaCode })).error;
+    setBusy(false);
+    if (vErr) { setError(vErr.message); setMfaCode(''); return; }
     onAuthenticated();
   }
 
@@ -79,6 +102,30 @@ export function AuthFormPage({ role, onBack, onAuthenticated }: { role: string; 
 
           {/* Form Content */}
           <div className="p-8 space-y-6">
+
+            {mfaFactorId ? (
+              <form className="space-y-4" onSubmit={submitMfa}>
+                <div className="space-y-1">
+                  <label className="font-['IBM_Plex_Mono',monospace] text-xs text-[#5E6E7A] uppercase">Authenticator code</label>
+                  <input
+                    type="text"
+                    inputMode="numeric"
+                    required
+                    autoFocus
+                    value={mfaCode}
+                    onChange={(e) => setMfaCode(e.target.value)}
+                    className="w-full bg-[#FFFFFF] border border-[#D7DEE3] p-3 text-[#0C1A26] focus:border-[#066E5A] outline-none transition-colors tracking-[0.4em] text-center"
+                    placeholder="000000"
+                    maxLength={6}
+                  />
+                </div>
+                {error && <p className="font-['IBM_Plex_Mono',monospace] text-xs text-[#A03020] leading-relaxed">{error}</p>}
+                {notice && <p className="font-['IBM_Plex_Mono',monospace] text-xs text-[#066E5A] leading-relaxed">{notice}</p>}
+                <button type="submit" disabled={busy} className="w-full bg-[#066E5A] text-[#F4F7F8] p-3 font-medium hover:bg-[#05564A] transition-colors mt-2 disabled:opacity-60">
+                  {busy ? 'Verifying…' : 'Verify'}
+                </button>
+              </form>
+            ) : (<>
 
             {/* Email Form */}
             <form className="space-y-4" onSubmit={submit}>
@@ -152,6 +199,7 @@ export function AuthFormPage({ role, onBack, onAuthenticated }: { role: string; 
                 </button>
               </p>
             </div>
+            </>)}
 
           </div>
         </div>
@@ -249,7 +297,7 @@ export function ResetPasswordPage({ onDone }: { onDone: () => void }) {
 }
 
 // --- ROLE SELECTION VIEW ---
-export function RoleSelectionPage({ onRoleSelect, onBack }: { onRoleSelect: (role: string) => void; onBack: () => void }) {
+export function RoleSelectionPage({ onRoleSelect, onBack, isAdmin }: { onRoleSelect: (role: string) => void; onBack: () => void; isAdmin?: boolean }) {
   return (
     <div className="min-h-screen bg-[#F2F4F7] flex flex-col items-center justify-center p-6">
 
@@ -313,6 +361,23 @@ export function RoleSelectionPage({ onRoleSelect, onBack }: { onRoleSelect: (rol
             </button>
           </div>
         </div>
+
+        {/* Admin entry — only rendered when the signed-in account carries the
+            server-set app_metadata admin claim */}
+        {isAdmin && (
+          <div className="bg-[#0C1A26] p-8 rounded-xl mb-12 flex items-center justify-between">
+            <div>
+              <div className="font-['IBM_Plex_Mono',monospace] text-xs text-[#9AB0BC] uppercase tracking-wider mb-2">Administrator</div>
+              <p className="text-[#D7DEE3] text-sm">Open the review queue and resolve contests, human-review requests, and reports.</p>
+            </div>
+            <button
+              onClick={() => onRoleSelect('admin')}
+              className="bg-[#066E5A] text-[#F4F7F8] px-6 py-3 rounded font-medium hover:bg-[#05564A] transition-colors whitespace-nowrap ml-6"
+            >
+              Admin console
+            </button>
+          </div>
+        )}
 
         {/* Footnotes */}
         <div className="space-y-6">
