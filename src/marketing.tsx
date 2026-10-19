@@ -140,7 +140,7 @@ export function LandingPage({
           </h1>
 
           <p className="text-lg text-[#5E6E7A] max-w-xl leading-relaxed">
-            Systematically connecting verified African engineers to global enterprise requirements through Telos assessment, verified upskilling, and bidirectional matching.
+            Systematically connecting verified African professionals to global enterprise requirements through Telos assessment, verified upskilling, and bidirectional matching.
           </p>
 
           <div className="flex flex-col sm:flex-row gap-4 pt-4">

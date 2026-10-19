@@ -3228,7 +3228,7 @@ function Shell({ role, exit, switchRole = exit, nav, active, transitionKey = act
     {hasNav && <nav className="fside" aria-label={`${role} navigation`}>
       {premiumBadge && <div style={{ margin: "2px 14px 8px", alignSelf: "flex-start", display: "inline-flex", alignItems: "center", gap: 5, fontFamily: F.mono, fontSize: 10, color: "#D6B25A", border: "1px solid #6B551F", borderRadius: 5, padding: "3px 8px" }}>FIND Premium Pro</div>}
       {nav.map(([k, lbl]) => <button key={k} className={"fnav" + (active === k ? " on" : "")} aria-current={active === k ? "page" : undefined} onClick={() => onNav(k)}>{lbl}{locked && locked.includes(k) && <span style={{ marginLeft: 6, color: "#B08A2E", display: "inline-flex", verticalAlign: "middle" }}><LockIcon size={10} /></span>}</button>)}
-      <button type="button" onClick={() => { void showOpenFeedbackSurvey(); }} aria-label="Share feedback" title="Share feedback" style={{ marginTop: "auto", marginInline: 12, minHeight: 42, display: "grid", placeItems: "center", color: "#9FB0BC", background: "transparent", border: "1px solid #24343F", borderRadius: 8, cursor: "pointer" }}><MessageCircle size={18} /></button>
+      <button type="button" onClick={() => { void showOpenFeedbackSurvey(); }} aria-label="Share feedback" title="Share feedback" style={{ marginTop: "auto", marginInline: 12, minHeight: 42, paddingInline: 12, display: "flex", alignItems: "center", justifyContent: "flex-start", gap: 9, color: "#9FB0BC", background: "transparent", border: "1px solid #24343F", borderRadius: 8, cursor: "pointer", fontFamily: F.mono, fontSize: 12 }}><MessageCircle size={18} aria-hidden="true" /><span>Feedback</span></button>
     </nav>}
     <main className="fmain">
       <AnimatePresence mode="wait" initial={false}>
