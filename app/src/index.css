@@ -1,6 +1,0 @@
-/* Tailwind utilities for the marketing views (marketing.tsx). Preflight is off
-   (see tailwind.config.js), so this adds only utility classes and does not reset
-   or affect the inline-styled app shell. */
-@tailwind base;
-@tailwind components;
-@tailwind utilities;

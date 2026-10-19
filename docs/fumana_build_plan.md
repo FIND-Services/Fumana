@@ -19,7 +19,7 @@ These two are structural. Building features on the current top-nav shell means r
    - Mobile bottom nav, toasts, Zuri dock gated off onboarding and interview.
    - Done when both portals render in the same Carbon shell and nothing else changed behaviorally.
 
-2. Shared network round trip in `app/`. NO MODEL.
+2. Shared network round trip in `src/`. NO MODEL.
    - A shared in-memory store of builders that the candidate side writes to on assessment completion and the employer search reads from.
    - Seed three or four builders so search is never empty.
    - Done when a profile finished on the candidate side appears, masked, in employer search.

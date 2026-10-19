@@ -10,16 +10,17 @@ Checklist format — each step says what "done" looks like.
 
 | Piece | Where it lives | Notes |
 |---|---|---|
-| Frontend | `app/` — React + Vite SPA, builds to `app/dist` | All routes are client-side; no SSR |
+| Frontend | Repository root — React + Vite SPA, builds to `dist` | All routes are client-side; no SSR |
 | Database + Auth | Supabase project `lvozhbnpvwsvjsdnebsl` | Postgres + RLS + GoTrue |
-| Edge functions | `app/supabase/functions/` | `llm-proxy`, `tts`, `verify-domain`, `notify` — already deployed |
+| Edge functions | `supabase/functions/` | `llm-proxy`, `tts`, `verify-domain`, `notify` — already deployed |
 | Storage | `builder-media` bucket (private) | Pitch videos + CV uploads |
 
-The app has **two postures** chosen entirely by env vars:
+The app has two independent environment choices:
 
-- **Demo mode** — no `VITE_SUPABASE_*` set → in-memory state, facade auth,
-  everything works offline. Good for a quick preview.
-- **Backend mode** — `VITE_SUPABASE_*` set → real auth, persistence, RLS.
+- **Authentication/backend** — `VITE_SUPABASE_*` must be set for real signup,
+  sign-in, persistence, and RLS. Authentication is never simulated.
+- **AI mode** — `DEMO_MODE=true` returns prepared AI responses without Gemini;
+  `DEMO_MODE=false` uses the configured Gemini secrets.
 
 ---
 
@@ -30,17 +31,15 @@ everything, so defaults work:
 
 ```json
 {
-  "installCommand": "cd app && npm install",
-  "buildCommand": "cd app && npm run build",
-  "outputDirectory": "app/dist",
+  "installCommand": "npm install",
+  "buildCommand": "npm run build",
+  "outputDirectory": "dist",
   "rewrites": [{ "source": "/(.*)", "destination": "/index.html" }]
 }
 ```
 
-**Alternative** (either/or — don't do both): set **Root Directory = `app`** in
-Settings → General and leave all overrides empty. If you use this path, do NOT
-copy the commands above into the override fields — `cd app` would run inside
-`app/` and fail.
+Keep **Root Directory** at the repository root. Do not set it to `app`; the
+frontend package and its configuration now live directly at the root.
 
 The catch-all rewrite is required — it routes every path to `index.html` so
 the SPA handles routing (including password-reset links).
@@ -54,7 +53,7 @@ the SPA handles routing (including password-reset links).
 
 Use the **anon/publishable** key — never `service_role`/secret. The anon key
 is designed to ship to browsers; RLS is what guards the data. Also in
-`app/.env` locally if you have repo access.
+`.env.local` at the repository root if you have repo access.
 
 **Done when:** after redeploy, the site loads AND signup/sign-in hits
 `*.supabase.co` (browser devtools → Network). Env vars never apply to old
@@ -73,23 +72,32 @@ Authentication → URL Configuration:
 | Field | Value |
 |---|---|
 | Site URL | `https://fumana-app.vercel.app` |
-| Redirect URLs (allow-list) | `https://fumana-app.vercel.app/**`, `http://localhost:5173/**` |
+| Redirect URLs (allow-list) | `https://fumana-app.vercel.app/**`, `http://localhost:5173/**`, `http://127.0.0.1:5173/**` |
 
-Without this, signup-confirmation and password-reset emails land users on a
-stale host and look broken.
+The application uses `/auth/callback` for Google OAuth and signup confirmation,
+and `/update-password` for password recovery. The wildcard entries above allow
+both routes. Without them, Supabase rejects the requested redirect.
 
 ### 2b. Email confirmation
 
 Authentication → Sign In / Providers → Email:
 
-- **"Confirm email" OFF** — while no verified sending domain exists. Signups
-  get instant sessions.
-- **"Confirm email" ON** — later, once custom SMTP (2c) and a verified sender
-  domain are configured.
+- **"Confirm email" ON** — required. New email/password users see a check-email
+  screen and cannot sign in until they open Supabase's confirmation link.
 - **Leaked-password protection ON** — same page. Checks passwords against
   HaveIBeenPwned; should always be enabled in production.
 
-### 2c. Custom SMTP (Brevo) — needed for password resets + confirmations
+### 2c. Google authentication
+
+Authentication → Sign In / Providers → Google:
+
+- Keep Google enabled and save the Google client ID and client secret only in
+  Supabase.
+- In Google Cloud, the authorized redirect URI must be
+  `https://lvozhbnpvwsvjsdnebsl.supabase.co/auth/v1/callback`.
+- Do not put the Google client secret in Vercel or any `VITE_` variable.
+
+### 2d. Custom SMTP (Brevo) — needed for password resets + confirmations
 
 Authentication → Emails → SMTP Settings → enable Custom SMTP:
 
@@ -105,16 +113,16 @@ Authentication → Emails → SMTP Settings → enable Custom SMTP:
 Until this is set, Supabase's built-in sender rate-limits to ~4 emails/hour
 and password resets silently fail for real users.
 
-### 2d. Edge Function secrets
+### 2e. Edge Function secrets
 
 Dashboard → Edge Functions → Secrets (or `supabase secrets set`):
 
 | Secret | Effect | Required |
 |---|---|---|
 | `DEMO_MODE` = `true` | LLM endpoint returns canned agent responses | **Pick one** |
-| `LLM_PROVIDER` + `LLM_API_KEY` (+ optional `LLM_MODEL`) | Real model calls (`anthropic` → claude-sonnet-4-6, `openai` → gpt-4o-mini) | ⤷ |
+| `LLM_PROVIDER` = `gemini` + `LLM_API_KEY` (+ optional `LLM_MODEL`) | Real Gemini calls (default model: `gemini-3.6-flash`) | ⤷ |
 | `ELEVENLABS_API_KEY` (+ optional `_VOICE_ID`, `_MODEL_ID`) | Real TTS voice; unset → browser SpeechSynthesis fallback | optional |
-| `BREVO_API_KEY` + `BREVO_SENDER` (+ optional `BREVO_SENDER_NAME`) | Activates the `notify` function — lifecycle emails (interview requested, SOW sent/accepted/declined, engagement closed) | optional |
+| `BREVO_API_KEY` + `BREVO_SENDER` (+ optional `BREVO_SENDER_NAME`) | Reserved for the maintained but currently unused `notify` function | optional / inactive |
 | `SUPABASE_*` | Auto-provided to functions — never set manually | — |
 
 Without `DEMO_MODE`/`LLM_*`, every AI feature shows its honest inert state —
@@ -132,7 +140,7 @@ that's deliberate, not a bug.
    persists (Supabase → Table Editor → `builders` has the row).
 4. **AI posture** — if `DEMO_MODE`/`LLM_*` set, interview/copilot features
    respond; if not, they show "waiting for backend" — both are correct.
-5. **Password reset** — only testable after 2c; request → email arrives →
+5. **Password reset** — only testable after 2d; request → email arrives →
    link opens the in-app set-password screen (needs 2a Site URL correct).
 6. **Admin console** — sign in as the admin account → role-select page shows
    an "Admin console" card → review queue loads.
@@ -147,10 +155,10 @@ that's deliberate, not a bug.
 | Blank page, assets 404 | `base` path wrong | `vite.config.js` sets `/` outside GitHub Actions — rebuild without `GITHUB_ACTIONS` env |
 | `Failed to fetch` on signup (browser) | Ad-blocker/extension or VPN killing the POST to `/auth/v1/signup` | Incognito mode, no extensions, different network — the endpoint itself is verified working |
 | 401s on `/rest/v1/builders`, `/rest/v1/matches` | **Expected** — anon reads are denied by design (identity shield) | Nothing |
-| Signup works but no confirmation email | Confirm-email off (2b), or SMTP not configured (2c) | Intended / set Brevo SMTP |
+| Signup works but no confirmation email | Confirm-email off (2b), or SMTP not configured (2d) | Enable confirmation / set Supabase SMTP |
 | Reset link lands on wrong site | Site URL stale | §2a |
-| AI features show waiting state | No `DEMO_MODE`/`LLM_*` secrets | §2d — intended inert behavior |
-| "Notification email never arrived" | `BREVO_API_KEY` unset | §2d — function returns `{sent:false}` honestly |
+| AI features show waiting state | No `DEMO_MODE`/`LLM_*` secrets | §2e — intended inert behavior |
+| "Lifecycle notification email never arrived" | Lifecycle email calls are disabled in the app | Expected; the Brevo-backed `notify` function is maintained but unused |
 
 ---
 
@@ -160,7 +168,7 @@ that's deliberate, not a bug.
   decision (Paystack / Flutterwave / Stripe). No real charges occur.
 - **Escrow/payouts are display-only** — same dependency.
 - **WhatsApp/SMS notification channels are roadmap** — email works via Brevo
-  once §2d is configured.
+  once §2e is configured.
 
 ## 6. Deployments in flight
 

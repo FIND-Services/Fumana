@@ -1,6 +1,6 @@
 # Employer onboarding spec
 
-Build the employer side in `app/` on the same IBM Carbon shell and Fumana palette as the candidate portal. This spec covers onboarding only: welcome, auth, company-info, alignment. Then land in the employer app shell.
+Build the employer side in `src/` on the same IBM Carbon shell and Fumana palette as the candidate portal. This spec covers onboarding only: welcome, auth, company-info, alignment. Then land in the employer app shell.
 
 Powered by Telos. Designed by Lexington Advisory Group.
 
