@@ -1,5 +1,5 @@
 # Fumana
-
+ 
 Fumana is a talent and remote-work platform that matches independent professionals ("builders") with employers. Zuri guides assessments, interviews, and career development. Telos handles scoring, evidence, compliance narration, and impact reasoning. Matching and financial figures are computed in code rather than invented by an AI model.
 
 This root README is the single setup and deployment guide for the repository. 
