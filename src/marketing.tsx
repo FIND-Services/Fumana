@@ -57,9 +57,19 @@ export function LandingPage({
   const [feedbackNotice, setFeedbackNotice] = useState('');
   const [highlightedCard, setHighlightedCard] = useState('');
   const highlightTimer = useRef<number | null>(null);
+  const openedFeedbackOnLoad = useRef(false);
 
   useEffect(() => () => {
     if (highlightTimer.current) window.clearTimeout(highlightTimer.current);
+  }, []);
+
+  useEffect(() => {
+    if (openedFeedbackOnLoad.current) return;
+    openedFeedbackOnLoad.current = true;
+    const timer = window.setTimeout(() => {
+      void showOpenFeedbackSurvey();
+    }, 900);
+    return () => window.clearTimeout(timer);
   }, []);
 
   useEffect(() => {
